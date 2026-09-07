@@ -5,7 +5,7 @@ Start it with no arguments and add boards from the web panel at http://HOST:8100
 
     python devagent.py                       # panel on http://127.0.0.1:8100/, boards added in the UI
     python devagent.py --bind 0.0.0.0 --token secret   # serve the network; the token is required
-    python devagent.py --add jam:O:\\:COM4:rp2350   # optional: define a board on the CLI
+    python devagent.py --add 'jam path=O:\\ port=COM4 ocd=rp2350'   # or define a board on the CLI
 
 Boards live in devagent.json next to this file, so a restart brings them back. Each board keeps
 its own serial reader, rolling console buffer and (optionally) its own OpenOCD instance on its
@@ -46,7 +46,7 @@ Endpoints (all take ?board=<id>; with one board configured it is optional)
     POST   /repl?ms=                    body is code; pasted into the REPL, nothing written
     POST   /reset?mode=soft|hard        soft reboot, or a real reset (SWD when a probe is up)
     GET    /video?w=&fps= · /snapshot?w=  HDMI capture: live MJPEG · one JPEG
-    GET    /bootloader/status           POST /bootloader/enter?method=repl|touch
+    GET    /bootloader/status           POST /bootloader/enter?method=repl|touch|auto
     POST   /uf2?enter=&wait=            body is a .uf2
     GET    /ocd/status                  POST /ocd/start · /ocd/stop · /ocd/cmd · /ocd/flash
     POST   /shutdown                    clean exit

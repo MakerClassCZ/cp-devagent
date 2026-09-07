@@ -1,293 +1,287 @@
-# devagent — your dev boards over HTTP
+# devagent — your CircuitPython boards over HTTP
 
-The bridge that makes a board testable from anywhere: its **drive**, its **serial console**, its
-**debug probe** and — with a capture card — its **screen**, over plain HTTP so `curl` works and
-any language can drive it. **One agent serves every board plugged into the host**; each board is
-a tab in the panel and a `?board=<id>` on the API.
+One Python file on the machine the boards are plugged into. It serves each board's **drive**,
+**serial console**, **debug probe** and — through a capture card — its **screen** over plain
+HTTP, so `curl` works, any language can drive it, and a script, a CI job or an AI agent can put
+a file on the board, run it, read what it printed and *look at what it drew*. A web panel
+(`ui.html`, no CDNs) and a Python client/CLI come with it.
 
-    host with the boards                    this machine (or CI, or an agent)
-    ┌──────────────────────────────┐        ┌──────────────────────────┐
-    │ devagent.py                  │◀─HTTP─▶│ devagent_client.py / curl│
-    │  jam  drive+serial+probe+HDMI│        └──────────────────────────┘
-    │  pad  drive+serial           │
-    │  …                           │
-    └──────────────────────────────┘
+    host with the boards                       anywhere on the network
+    ┌────────────────────────────────┐         ┌─────────────────────────────┐
+    │ devagent.py  :8100             │◀──HTTP──▶│ browser  → the panel        │
+    │   pico   drive + serial        │         │ devagent_client.py / curl   │
+    │   jam    drive + serial + SWD  │         │ your script, your agent     │
+    │          + HDMI capture        │         └─────────────────────────────┘
+    └────────────────────────────────┘
 
-Boards are defined **in the panel**, not on the command line, and kept in `devagent.json` next
-to the script, so the agent comes back with the same set after a restart.
+**One agent, every board on the host.** Each board is a tab in the panel and a `?board=<id>`
+on the API. Boards are kept in `devagent.json` next to the script, so a restart brings them
+back — and a board that comes back on another COM port or drive letter is found again by its
+USB serial number, without an edit.
 
-## Boards: adding, editing, and why a new COM port needs no edit
-
-**Add** with the `＋ board` tab: the form is filled from what the host can see (ports, drives,
-OpenOCD configs, capture devices), each labelled with the board that sits on it — `COM4 — Adafruit
-Fruit Jam with rp2350b`, `O:\ ← Adafruit Fruit Jam with rp2350b`, and `· used by <board>` when
-another entry already has it. **Edit** with the *Edit board* button, or click the `drive`/`serial`
-pill in the header; the same form comes back pre-filled. **Forget** drops the entry (the board
-itself is untouched).
-
-**A COM-port or drive-letter change does not need an edit.** The UID CircuitPython prints in
-`boot_out.txt` is also the board's USB serial number, so the agent learns it on first contact,
-saves it, and when a configured port or drive vanishes — or the OS hands its name to a different
-board — it re-points the entry at wherever that UID turned up (a grey `[devagent] serial COM3 ->
-COM7` line in the console says so). Edit only to point an entry at *different* hardware; the UID
-is then re-learnt.
-
-The header pill says why a configured port is silent: `serial COM3 missing` (not on the host) vs
-`serial COM3 busy` (present, but another program — Mu, Thonny, a terminal — holds it).
-
-From a script or the CLI: `board port=COM7` edits one field of the selected board (`POST /boards`
-with the id and only the fields to change; keys left out keep their value, `null`/`none` clears
-one), `boards` lists them with their UID, `forget [ID]` drops one.
-
-## Web control panel
-
-Open `http://HOST:PORT/` in a browser. One page, no CDNs (it has to work on a bare LAN):
-
-* **Console** — a real terminal, not a text box. The agent holds the serial port exclusively, so
-  this is how you reach the board while it runs. Click it and type: keys go straight through, so
-  REPL history (arrows), Tab completion and line editing behave normally, and nothing is echoed
-  locally — what you see is what the board sent back. Ctrl-any-letter works; a multi-line paste
-  is wrapped in the REPL's own paste mode so indentation survives. It understands the escape
-  subset CircuitPython actually emits: SGR colours (a traceback is red), `\r` overwrites the line
-  instead of stacking copies, erase-to-end-of-line, and the OSC title string is swallowed rather
-  than printed as `]0;...` noise. The board you are looking at is **long-polled** — a read
-  returns the moment the board says anything — so a keystroke is echoed in about 25 ms and an
-  idle console makes no requests at all; the other boards get an occasional non-blocking read.
-* **Board tabs** — one per board, each with its own console scrollback. Every board is polled in
-  the background, so output that arrives while you are looking at another tab is still there when
-  you switch back. `＋ board` opens a form filled from what the host can actually see (drives,
-  COM ports, OpenOCD configs, capture devices) — no guessing at names.
-* **Screen** — the board's HDMI output through a capture card, live in the page (MJPEG straight
-  into an `<img>`, no player, no plugin). Click the picture for a full-size still. The capture
-  card is opened only while the stream runs, so it stays free for OBS the rest of the time.
-* **Board** — cached identity (CP version, board id, free RAM — probed once, it does not change
-  while the board is plugged in), one-click **scripts** (I²C scan, pins, frozen modules, memory,
-  storage; drop your own `.py` in `snippets/` and it appears next to them), **soft/hard reset**
-  (hard goes over SWD when a probe is running, otherwise `microcontroller.reset()`), enter the
-  bootloader (through the REPL, so nothing is persisted) and drop a `.uf2` on it; start/stop
-  OpenOCD, run a probe command, flash an `.elf` over SWD.
-* **The split is yours** — drag the edge between the console and the right column (it is
-  remembered per browser), or double-click it to snap the column to the captured picture shown
-  1:1. A 640x480 screen next to a full-height console needs the room.
-* **Files** — browse (including subdirectories), upload, download, delete, mkdir. Uploads report
-  a write mismatch loudly, and the bootloader-loop guard surfaces as a dialog rather than a
-  silent failure.
-
-Set `--token` and the panel asks for it once and keeps it in that browser; every data request
-carries it. Without a token anyone on the LAN can write files and flash firmware.
-
-## Seeing the screen
-
-A USB HDMI capture card plugged into the host turns into two endpoints: `/video` (a live MJPEG
-stream) and `/snapshot` (one JPEG). Both share **one ffmpeg per device** — a capture card can be
-opened only once, so a snapshot taken while the panel is streaming reads the stream's latest
-frame instead of failing with "device already in use"; it comes back in about a millisecond.
-The card is released as soon as the last viewer leaves.
-
-Set the board's capture **mode** to the resolution it actually outputs (`640x480` for a Fruit
-Jam over DVI). Grabbers happily report 16:9 and stretch a 4:3 source into it — asking for the
-native mode is what keeps the pixels square and 1:1, which matters when you are looking at a
-320x240 game. With a mode set, nothing is rescaled.
-
-The still is the useful half for automation —
-
-    devagent_client.py --host 192.168.1.150 --port 8101 --board jam snapshot screen.jpg
-
-— because it lets a script, a CI job or an agent **look at what the board is actually drawing**
-instead of inferring it from serial output. Needs `ffmpeg` on the host (`--ffmpeg PATH` if it is
-not on `PATH`). Set a board's capture device to `test` to get a colour-bar generator and check
-the plumbing without a card.
-
-## Boards without USB mass storage
-
-`--fs repl` (or `auto`, which prefers a mounted drive) serves files over the serial REPL using
-[MakerClassCZ/circuitpython-filesystem](https://github.com/MakerClassCZ/circuitpython-filesystem)
-— put its `cpfs.py` next to `devagent.py` or on `PYTHONPATH`. The HTTP API does not change, so
-every client and the web panel work identically on a board with no drive at all; only `/free`
-stays drive-only. Each operation borrows the port from the console reader and hands it back.
-
-## Run it (on the host the boards are plugged into)
+## Quick start
 
     pip install pyserial
-    python devagent.py --port 8100 --token secret       # then add boards in the panel
-    python devagent.py --port 8100 --add jam:O:\:COM4:rp2350 --add pad:N:\:COM6
+    python devagent.py                       # panel on http://127.0.0.1:8100/  — add boards there
 
-`--add id:drive:serial[:ocdcfg]` is only a shortcut for the first run; boards added either way
-are saved to `devagent.json` and come back on the next start.
+Or define the board on the command line (it is saved too):
 
-If the port is taken it says **who** has it (another devagent reports its drive and serial)
-instead of dying on a traceback; `--replace` asks the old one to exit and takes over.
+    python devagent.py --add 'pico path=/media/you/CIRCUITPY port=/dev/ttyACM0'     # Linux
+    python devagent.py --add 'pico path=/Volumes/CIRCUITPY port=/dev/cu.usbmodem1101' # macOS
+    python devagent.py --add "pico path=E:\ port=COM4"                               # Windows
 
-## Use it
+To reach it from other machines, bind the network and set a token (the agent refuses to serve
+a network without one — `--open` is the deliberate exception for a network you trust):
 
-    python devagent_client.py --host 192.168.1.150 --port 8101 [--board jam] [--token T] health
-    ... boards                 ... board port=COM7           ... forget [ID]
-    ... info                   ... reset [soft|hard]
-    ... snippets               ... snippet i2c                ... snapshot screen.jpg
-    ... put game.py            ... puttree assets/ assets     ... rm old.py
-    ... mkdir scenes           ... rmdir scenes --recursive   ... list --recursive
-    ... free                   ... ports
-    ... run bench.py --ms 20000            upload + soft-reboot + capture output
-    ... repl "import game; game.main()"    paste into the REPL, no filesystem write
-    ... ocd start | status | stop          ... ocd cmd "halt"
-    ... flash build/firmware.elf           program over SWD
-    ... shell                              interactive: the same commands at a prompt
-    ... console                            live terminal on the board's REPL
+    python devagent.py --bind 0.0.0.0 --token SECRET        # or DEVAGENT_TOKEN=SECRET
 
-### Interactive: `shell` and `console`
+Then, from anywhere:
 
-`shell` keeps host/port/token and the current board between commands, so a session is
-`use jam` · `put game.py` · `repl "import game"` · `list` instead of the full command line each
-time. Tab completes command names, board ids (`use`), snippet ids, local paths (`put`, `run`,
-`uf2`, `flash`) and remote paths (`get`, `rm`, `mkdir`, the target of `put`); history and line
-editing come from readline where the platform has it. Every line goes through the same
-dispatcher as the CLI, so nothing can behave differently at the prompt.
+    python devagent_client.py --host 192.168.1.50 --token SECRET list
+    python devagent_client.py --host 192.168.1.50 --token SECRET run game.py --ms 10000
+    curl -H 'X-Token: SECRET' 'http://192.168.1.50:8100/snapshot?board=jam' -o screen.jpg
 
-    $ python devagent_client.py --host 192.168.1.150 shell
-    devagent http://192.168.1.150:8100 · boards: jam, picopad · `use ID` switches, `console` = live REPL, Ctrl-D quits
-    192.168.1.150:8100> use picopad
-    picopad> put game.py
-    picopad> repl "import game"
-    picopad> console
-    --- console on picopad: Ctrl-] leaves, Ctrl-C / Ctrl-D go to the board ---
-    >>> import gc; gc.mem_free()
-    98432
-    >>> ^]
-    --- console closed ---
-    picopad> quit
+No hardware at hand? `python tests/fakeboard.py` prints a port and a drive to `--add`: a pty
+that answers like the REPL and a directory that looks like CIRCUITPY.
 
-`console` is what `screen`/`tio` are on a local serial port — a raw terminal on the board's
-REPL, through the agent. Keystrokes go to `/serial/write` as you type them; output comes from
-`/serial/tail`, which consumes nothing, so the web panel's console keeps showing the same
-stream. `Ctrl-C` interrupts the running program and `Ctrl-D` soft-reboots it, as on a serial
-terminal; `Ctrl-]` (as in telnet) closes the console, leaving the board as it is. Arrow keys
-reach the REPL's history on Windows as well. Needs agent v6+ (`/serial/tail`) and a real
-terminal (stdin must be a tty). It is a terminal, not a recorder — for capturing a run's output
-use `run`/`repl`, or `tail` from a script.
+### Requirements
 
-Or import it, which is the point — no session should re-derive this:
+* Python 3.7+ and `pyserial` (the console half; without it the file half still works).
+* Linux: your user in the `dialout` group and ModemManager told to leave the board alone —
+  `udev/99-circuitpython.rules` does both, install steps are in the file.
+* Optional: `ffmpeg` for the screen (`--ffmpeg PATH` if it is not on `PATH`), `openocd` for
+  SWD (`--openocd PATH`), and `cpfs.py` from
+  [MakerClassCZ/circuitpython-filesystem](https://github.com/MakerClassCZ/circuitpython-filesystem)
+  next to `devagent.py` for boards that have no USB drive at all.
+
+Windows, Linux and macOS are supported; the capture path is tested on Windows and Linux, reports
+from macOS are welcome.
+
+## The panel
+
+Open `http://HOST:PORT/`. With a token set the page asks for it once and keeps it in that
+browser.
+
+* **Console** — a real terminal, not a text box. The agent holds the serial port exclusively,
+  so this is how you reach the board while it runs. Keys go straight through (REPL history,
+  Tab completion and line editing behave; Ctrl-C interrupts, Ctrl-D reboots, Ctrl-] and the
+  other control codes exist); a multi-line paste is wrapped in the REPL's paste mode so
+  indentation survives. It understands the escape subset CircuitPython emits — colours, `\r`
+  overwrite, erase-to-end-of-line, the OSC title. The board you are looking at is long-polled,
+  so an echo arrives in ~25 ms and an idle console makes no requests; the other tabs get an
+  occasional non-blocking read, so their output is there when you switch back. If the agent
+  goes away the console says so once and picks up where it left off when it is back.
+* **Board** — cached identity (CP version, board id, free RAM), one-click **scripts** (I²C
+  scan, pins, frozen modules, memory, storage — drop your own `.py` in `snippets/` and it
+  appears next to them), soft/hard reset (hard goes over SWD when a probe is running), enter the
+  bootloader through the REPL and drop a `.uf2` on it, start/stop OpenOCD, run a probe command,
+  flash an `.elf`.
+* **Screen** — the board's HDMI output through a capture card, live in the page (MJPEG into an
+  `<img>`); click it for a full-size still. The card is opened only while someone watches.
+* **Files** — browse, upload, download, delete, mkdir; a write mismatch and the bootloader-loop
+  guard are dialogs, not silent failures.
+* **＋ board / Edit / Forget** — the form is filled from what the host can see (ports, drives,
+  OpenOCD configs, capture devices), each labelled with the board that sits on it; a port or
+  drive the host cannot see right now can be typed in.
+
+## The client
+
+`devagent_client.py` is the CLI, an interactive shell, a live console and an importable class,
+all on the same dispatcher.
+
+    devagent_client.py --host H [--port 8100] [--board ID] [--token T] COMMAND ...
+
+    health · version · ports · boards · board KEY=VALUE ... · forget [ID] · info [refresh] · reset [soft|hard]
+    list [--dir D] [--recursive] · get FILE · put FILE [REMOTE] [--force] · puttree DIR [REMOTE]
+    rm FILE · mkdir DIR · rmdir DIR [--recursive] · free
+    run FILE [--as code.py] [--ms 8000]      upload + soft reboot + capture the output
+    repl "CODE" [--ms 6000]                  paste into the REPL, nothing written to the board
+    read [--ms N] · tail [--from N] · write TEXT · reboot
+    snippets · snippet ID · snapshot [FILE] [--width W]
+    bootloader [enter [repl|touch|auto]] · uf2 FILE · ocd start [CFG]|status|stop · ocd cmd "halt" · flash FILE.elf
+    shell                                    the same commands at a prompt (Tab completion, history)
+    console                                  a raw terminal on the board's REPL; Ctrl-] leaves
+
+`--board` is optional while one board is configured. `DEVAGENT_TOKEN` stands in for `--token`.
+Errors are errors: a failed command prints `error: <what> (HTTP <status>)` and exits 1; an agent
+that cannot be reached exits 2 with a hint about where it should be running.
 
 ```python
-from devagent_client import Dev
-d = Dev("192.168.1.150", 8101, board="jam", token="secret")
-d.put("doomlite.py")
-print(d.repl("import doomlite; doomlite.main()", ms=6000))
-d.snapshot("screen.jpg")          # and look at what it drew
+from devagent_client import Dev, DevError
+d = Dev("192.168.1.50", 8100, board="jam", token="SECRET")
+d.put("game.py")
+print(d.repl("import game; game.main()", ms=6000))
+d.snapshot("screen.jpg")               # what the board is drawing right now
+try:
+    d.get("missing.py")
+except DevError as e:
+    print(e.status, e)                 # 404 no such file: missing.py (HTTP 404)
 ```
 
-## Two ways to flash, and the trap between them
+`console` is what `screen`/`tio` are on a local serial port, through the agent: keystrokes go to
+`/serial/write`, output comes from `/serial/tail` (which consumes nothing, so the panel keeps
+showing the same stream). It is a terminal, not a recorder — to capture a run use `run`/`repl`,
+or `tail` from a script.
 
-**With a probe (preferred):** `flash build/firmware.elf` programs over SWD. No bootloader, no
-volume juggling, and it works even when the board is wedged in a hard fault.
+## The HTTP API
 
-**Without a probe (UF2):**
-
-    devagent_client.py ... bootloader          # is a UF2 volume mounted?
-    devagent_client.py ... bootloader enter    # BOOTSEL via the REPL - nothing persisted
-    devagent_client.py ... uf2 firmware.uf2    # enters if needed, copies, waits for the board back
-
-### The trap this guards against
-
-Asking for the bootloader **from `code.py`** cycles the board: the flash lands, `code.py` runs,
-it requests BOOTSEL again, and you are back where you started — recoverable only by flashing a
-flash-erase UF2. So an auto-run file (`code.py`, `main.py`, `boot.py`, `code.txt`, `main.txt`)
-whose contents mention `RunMode.BOOTLOADER`, `on_next_reset` or `reset_to_bootloader` is
-**refused** with an explanation:
-
-    $ devagent_client.py ... put trap.py code.py
-    {"error": "refusing to write code.py: it contains RunMode.BOOTLOADER + on_next_reset. ..."}
-
-The same file under any other name is written normally, and `?force=1` overrides the guard when
-you genuinely mean it. `bootloader enter` is the safe route: it drives the REPL, so nothing
-survives the reset.
-
-## Things it knows that cost us time to learn
-
-* **Nothing is cached.** A reset re-enumerates USB and invalidates handles; the drive is
-  re-resolved and the port re-opened per request. That is what a normal FTP/file server gets
-  wrong — it caches a handle and then returns errors forever.
-* **Writes are verified.** Every write is open → write → flush → fsync → close, then re-read,
-  so the reply carries the sha256 of what is *actually* on disk. A stale-cache "success" is
-  how a FAT got corrupted once.
-* **Firmware is uploaded, not path-referenced.** OpenOCD runs on the agent's host and cannot
-  see your filesystem — `flash` sends the image as the request body and stages it there.
-* **The TCL port (6666) swallows OpenOCD's log; telnet (4444) echoes it.** Anything whose
-  failure reason matters goes through telnet, which is why `flash` reports a real error.
-* **A dropped client is not an error.** The panel aborts its `/serial/read` long-poll on every
-  tab switch and closes snapshot/video mid-write; the handler's write then fails with a
-  `ConnectionError` (`ConnectionAbortedError` / WinError 10053 on Windows). The server swallows
-  those instead of printing the traceback `socketserver` would, and a long-poll checks every
-  quarter second whether its client is still connected — an abandoned `read` used to keep
-  consuming the console for the rest of its 15 s window, stealing output from the panel's new
-  poll (v8).
-* **`repl` beats `run` for anything that resets the board.** A reset left in `code.py` re-runs
-  on every boot and traps the board in a loop; `repl` never touches the drive.
-* **The REPL eats the first character after Ctrl-C**, so the client sends a bare newline first.
-* **A UF2 copy "fails" on success.** The board reboots the instant the last block lands, so the
-  volume disappears mid-write; `uf2` treats a vanished volume after a full write as the normal
-  ending. Code that calls that an error reports a false failure on every good flash.
-* **Start a board's reader AFTER the board is registered.** It used to start inside `Board()`,
-  i.e. while `BOARDS[id] = Board(...)` was still evaluating - so the thread's first "am I still
-  registered?" check said no and it exited. Every board came up with a dead console and every
-  scripted run returned nothing.
-* **One stream, two readers.** The panel polls the console while a script runs over the same
-  port, and a read that empties the buffer means whoever asked first wins. Scripted runs read
-  through a *tap* (their own copy) and pause the console feed, so the button prints the answer
-  instead of the script's own echo.
-* **A console read must return when data arrives, not when its window expires.** Waiting out the
-  full poll window put up to a quarter second between a keypress and its echo; returning on the
-  first byte (plus 15 ms to gather the burst) puts it at ~25 ms. The port read timeout matters
-  too: the reader holds the port lock, so a long one makes every write queue behind it.
-* **The console buffer has exactly one consumer.** A read takes the bytes, so two panels (or a
-  panel and a `read` from the CLI) on the same board split the output between them. Scripted
-  runs are safe - they use a tap - but do not point two consoles at one board and expect both to
-  show everything.
-* **Long-polling breaks `networkidle`.** Any automation that waits for an idle network against
-  this panel hangs forever - wait for `domcontentloaded`.
-* **Keystrokes must go out on one chain.** Sending each key as its own fetch lets them race;
-  `print(6*7)` arrived as `print(6)*7`. The panel queues and batches instead.
-* **Snippet bodies are raw strings.** A `"\n"` inside one is CircuitPython source, not a newline
-  - unescaped it reached the board as an unterminated string literal.
-* **ffmpeg 7 changed `-list_devices` output** (per-line `(video)` tags instead of section
-  headers), so a parser written for ffmpeg 6 reports "no capture devices" next to a working
-  card. Both formats are parsed, and an empty list always comes with a reason.
-* **A board with no console must say so.** Every REPL-driven action (info, snippets, soft reset)
-  checks the port first and returns the reason; the earlier version silently returned an empty
-  string, which reads exactly like "the board printed nothing".
-* **In the bootloader the CIRCUITPY drive is gone**, so `/bootloader/status` is answered before
-  the drive check — otherwise the one endpoint you need during recovery would 503.
-
-## Endpoints
+Every board-scoped endpoint takes `?board=<id>` (optional with one board configured). With a
+token set, every request except `/`, `/version` carries it as `X-Token: T` or `?token=T`.
+Replies are JSON unless noted; `ms` values are milliseconds, capped at 60000.
 
 | | |
 |---|---|
-| `GET /health` `/version` `/free` | status, feature detection |
-| `GET /discover` | what the host can see: ports (with USB serial number), drives (with the `boot_out.txt` name / board id / UID), OpenOCD configs, capture devices |
-| `GET/POST/DELETE /boards` | list / add-or-edit / forget a board (saved to `devagent.json`). POST merges: send the `id` and only the fields to change; `null` clears one. Status carries `uid` and `port_present` (v7) |
-| `GET /info?refresh=` | cached board identity |
-| `GET /snippets` · `POST /snippet?id=&ms=` | canned scripts and their output |
-| `POST /reset?mode=soft\|hard` | reboot (hard = SWD if a probe is up) |
-| `GET /video?w=&fps=&size=` · `GET /snapshot` | HDMI capture: MJPEG stream / one JPEG (shared) |
-| `POST /repl?ms=` | body is code, pasted into the REPL; nothing written to the board |
-| `GET /list?dir=&recursive=` | listing, directories marked |
-| `GET|PUT|DELETE /file?name=` | read / write (parents auto-created, `force=1` to override the guard) / delete |
-| `POST /mkdir?name=` · `DELETE /dir?name=&recursive=` | directories |
-| `GET /serial/read?ms=` · `POST /serial/write` · `POST /serial/reboot` | console (`read` consumes — one reader at a time) |
-| `GET /serial/tail?from=&ms=` | console without consuming: `{next, text}` from offset `from` on (`from=-1` = cursor at the current end); safe next to the panel's `read` loop (v6) |
-| `POST /run?name=&ms=` | upload + reboot + capture |
-| `GET /ocd/status` · `POST /ocd/start|stop|cmd` | probe control |
-| `POST /ocd/flash?verify=&reset=` | body is the firmware image (SWD) |
-| `GET /bootloader/status` · `POST /bootloader/enter?method=` | BOOTSEL, via REPL or 1200-baud touch |
-| `POST /uf2?enter=&wait=` | body is a .uf2; copied to the bootloader volume |
-| `POST /shutdown` | clean exit (used by `--replace`) |
-| `GET /` | the web control panel (`ui.html`, edit it in place) |
+| `GET /health` `/version` | agent version, uptime, pyserial/cpfs present, every board's status |
+| `GET /discover` | what the host can see: serial ports (with USB serial number), drives (with the `boot_out.txt` board name / UID), OpenOCD configs, capture devices |
+| `GET /boards` · `POST /boards` · `DELETE /boards?id=` | list · add-or-edit (JSON body: `id` + only the fields to change; `null` clears one) · forget |
+| `GET /list?dir=&recursive=` | `[{name, dir, size}]` |
+| `GET /file?name=` · `PUT /file?name=[&force=1]` · `DELETE /file?name=` | read (bytes) · write, verified — the reply carries `matches_sent` and the `sha256` of what is on disk · delete |
+| `POST /mkdir?name=` · `DELETE /dir?name=[&recursive=1]` · `GET /free` | directories, free space |
+| `GET /serial/read?ms=` | console output (text). **Consumes**: one reader at a time. Returns as soon as the board says anything, or empty after `ms` (`ms=0` = non-blocking) |
+| `GET /serial/tail?from=&ms=` | console output by cursor, **consumes nothing**: `{next, text, gap}`; `from=-1` starts at the current end |
+| `POST /serial/write` · `POST /serial/reboot` | raw bytes to the board · Ctrl-D |
+| `POST /repl?ms=` | body is code, pasted into the REPL; `{output}` |
+| `POST /run?name=&ms=` | upload + soft reboot + capture; `{output, matches_sent, ...}` |
+| `GET /info[?refresh=1]` | board identity, probed once over the REPL and cached |
+| `GET /snippets` · `POST /snippet?id=&ms=` | canned REPL scripts and their output |
+| `POST /reset?mode=soft\|hard` | soft reboot, or a real reset (SWD when a probe is up) |
+| `GET /snapshot?w=` · `GET /video?w=&fps=` | one JPEG · live MJPEG, from the board's capture device (`device=test` is a colour-bar generator) |
+| `GET /bootloader/status` · `POST /bootloader/enter?method=repl\|touch\|auto` | is a UF2 volume mounted · enter it (REPL, or the 1200-baud touch) |
+| `POST /uf2?enter=&wait=` | body is a `.uf2`; copied to the bootloader volume |
+| `GET /ocd/status` · `POST /ocd/start?cfg=` `/ocd/stop` `/ocd/cmd` · `POST /ocd/flash?verify=&reset=` | OpenOCD per board on its own ports; body of `/flash` is the image |
+| `POST /shutdown` | clean exit (also what `--replace` asks a previous instance for) |
 
-Every board-specific endpoint takes `?board=<id>` (optional when only one board is configured)
-and, if the agent was started with `--token`, `?token=` or an `X-Token:` header.
+**Status codes mean what they say.** `400` a bad parameter (the message names it), `401` no or
+wrong token, `403` a Host or Origin that is not this agent, `404` no such board / file / path,
+`409` refused on purpose (the bootloader-loop guard, a non-empty directory), `503` the board is
+not available for that (drive unplugged, port busy, no console, OpenOCD not running — the
+message says which), `502` a flash or capture that ran and failed, with ffmpeg's/OpenOCD's own
+words. A board operation that reports an error never comes back as `200`.
 
-## Not done yet
+## Boards
 
-Physical button injection and per-board power measurement — the remaining pieces of the
-autonomous test-cluster plan. See `review/hw-cluster/`. (Display capture is done, but through a
-capture card on the host; the planned SPI sniffer would cover boards whose panel never leaves
-the PCB.)
+`devagent.json` holds the list; the panel, `POST /boards`, `board key=value` in the client and
+`--add 'ID key=value ...'` all edit the same entries. Fields: `label`, `path` (the drive),
+`port`, `baud`, `fs` (`auto` / `msc` / `repl`), `ocd` (an OpenOCD target config such as `rp2040`
+or `rp2350`, giving that board its own OpenOCD instance on its own ports), `video` (a capture
+device) and `video_size` (its native mode, `640x480` — ask for the mode the board outputs, or
+the grabber stretches 4:3 into 16:9), `index` (tab order).
+
+**A port or drive change needs no edit.** The UID CircuitPython prints in `boot_out.txt` is the
+board's USB serial number too, so the agent learns it on first contact (from either) and, when the configured
+port or drive vanishes or the OS hands its name to a different board, re-points the entry at
+wherever that UID turned up (a grey `[devagent] serial COM3 -> COM7` line in the console says
+so). A drive that carries *another* board's UID is not written to — the write answers 503
+instead of landing on the wrong board. The header pill says why a port is silent: `missing`
+(not on the host) or `busy` (another program — Mu, Thonny, a terminal — holds it).
+
+**Boards without a drive** — `fs=repl` (or `auto`, which prefers a mounted drive) serves the
+same file API over the REPL with `cpfs.py`; only `/free` stays drive-only.
+
+**Two ways to flash.** With a probe, `flash firmware.elf` programs over SWD — no bootloader, no
+volume juggling, and it works on a board wedged in a hard fault. Without one, `bootloader enter`
+drives the REPL into BOOTSEL (nothing is persisted) and `uf2 firmware.uf2` copies the image and
+waits for the board to come back. Asking for the bootloader **from `code.py`** is the trap: the
+flash lands, `code.py` runs, it requests BOOTSEL again, and only a flash-erase UF2 gets you out.
+So an auto-run file (`code.py`, `main.py`, `boot.py`, `.txt` variants) that mentions
+`RunMode.BOOTLOADER`, `on_next_reset` or `reset_to_bootloader` is refused with an explanation;
+`?force=1` (`--force`) overrides it when you mean it.
+
+## Security
+
+The agent writes files and flashes firmware, so it treats the network as hostile:
+
+* It listens on `127.0.0.1` by default. `--bind 0.0.0.0` without `--token` is refused; `--open`
+  is the explicit override for a trusted network.
+* The token is compared in constant time and accepted as `X-Token` or `?token=`; the panel
+  stores it in the browser only. Rotate it with `--token NEW` (`--token ''` forgets it).
+* A browser tab on some other site cannot use your agent: requests must carry a Host that is
+  this machine (IP, `localhost`, its hostname or `--allow-host NAME`) and an Origin that is the
+  panel itself or an `--allow-origin URL` you listed (CORS with preflight for those).
+* File names are confined to the board's drive (`..` and absolute paths answer 400/404), the
+  drive must carry the board's own `boot_out.txt` (`--any-path` relaxes that for a plain
+  directory), request bodies are capped (`--max-body MB`, default 64), OpenOCD's ports bind to
+  `127.0.0.1` (`--ocd-bind`).
+
+It is still an HTTP service with write access to hardware — put it behind a VPN or an SSH tunnel
+rather than on the open internet.
+
+## Troubleshooting
+
+* **`serial /dev/ttyACM0 busy` right after plugging in (Linux)** — ModemManager is probing the
+  port; the udev rule in `udev/` stops it. **Permission denied** — add yourself to `dialout`
+  (or the rule's group) and log in again.
+* **Console empty, REPL commands time out** — the board is running `code.py` and not at a
+  prompt: Ctrl-C in the console, or `reset`. A board that prints nothing at all after Ctrl-C may
+  be in the bootloader (`bootloader` says).
+* **A big `repl` paste comes back with a `SyntaxError`** — the friendly REPL on an RP2040 drops
+  characters somewhere past ~2 kB of paste. The paste goes out in 256-byte slices, which helps
+  but is not a cure; for anything that size use `run` (a file) instead.
+* **`/info` or a script answers 503 "no reply"** — same cause; the agent never returns an empty
+  string that looks like "the board printed nothing".
+* **Nothing appears in the panel from another machine** — `403` in the browser console means
+  the Host or Origin check: reach the agent by IP or hostname, or add `--allow-host`.
+* **`pip install pyserial` says it is installed but the agent says it is missing** — a different
+  Python; start the agent with the interpreter you installed into.
+* **A board that came back on another port is still `missing`** — the follow works from the
+  UID the agent learnt on first contact (`boards` shows it); a board it never saw is only the
+  name you typed. Edit the port once, and from then on it is found by UID.
+
+## Tests
+
+    pip install pyserial
+    python tests/test_agent.py                      # ~20 s: the agent end to end on a fake board
+
+Needs no hardware: `tests/fakeboard.py` is a pty that answers like the REPL plus a temp drive.
+The suite starts the agent in a temp directory, so your `devagent.json` is untouched. The
+capture tests run when `ffmpeg` is installed. `tests/test_panel.mjs` drives the panel in a
+headless browser (Playwright) against a running agent — see its header.
+
+## Things it knows that cost time to learn
+
+* **Nothing is cached.** A reset re-enumerates USB and invalidates handles; the drive is
+  re-resolved and the port re-opened per request. That is what a normal file server gets wrong —
+  it caches a handle and then returns errors forever.
+* **Writes are verified.** Every write is open → write → flush → fsync → close, then re-read, so
+  the reply carries the sha256 of what is *actually* on disk. A stale-cache "success" is how a
+  FAT got corrupted once.
+* **Firmware is uploaded, not path-referenced.** OpenOCD runs on the agent's host and cannot see
+  your filesystem — `flash` sends the image as the request body and stages it there.
+* **The TCL port swallows OpenOCD's log; telnet echoes it.** Anything whose failure reason
+  matters goes through telnet, which is why `flash` reports a real error.
+* **A dropped client is not an error.** The panel aborts its long-poll on every tab switch and
+  closes a stream mid-write; the server swallows the resulting `ConnectionError` instead of a
+  traceback, and a long-poll checks every quarter second whether its client is still there — an
+  abandoned read used to keep consuming the console for the rest of its window.
+* **`repl` beats `run` for anything that resets the board.** A reset left in `code.py` re-runs
+  on every boot; `repl` never touches the drive.
+* **The REPL eats the first character after Ctrl-C**, so the client sends a bare newline first.
+* **A UF2 copy "fails" on success.** The board reboots the instant the last block lands, so the
+  volume disappears mid-write; a vanished volume after a full write is the normal ending.
+* **One stream, two readers.** The panel polls the console while a script runs over the same
+  port, and a read that empties the buffer means whoever asked first wins. Scripted runs read
+  through a *tap* (their own copy) and pause the console feed.
+* **A console read must return when data arrives, not when its window expires.** Waiting out the
+  window put a quarter second between a keypress and its echo; returning on the first byte plus
+  15 ms to gather the burst puts it at ~25 ms.
+* **The console buffer has exactly one consumer.** Two panels, or a panel and a CLI `read`, on
+  the same board split the output. `tail` is the non-consuming way to watch.
+* **Keystrokes must go out on one chain.** Sending each key as its own request lets them race:
+  `print(6*7)` arrived as `print(6)*7`. The panel queues and batches.
+* **Snippet bodies are raw strings.** A `"\n"` inside one is CircuitPython source, not a
+  newline — unescaped it reached the board as an unterminated string literal.
+* **ffmpeg 7 changed `-list_devices` output**, so a parser written for ffmpeg 6 reports "no
+  capture devices" next to a working card. Both formats are parsed, and an empty list always
+  comes with a reason.
+* **In the bootloader the CIRCUITPY drive is gone**, so `/bootloader/status` is answered before
+  the drive check — otherwise the one endpoint you need during recovery would 503.
+* **Serial ports are opened exclusively.** Two agents (or an agent and Thonny) on one port
+  silently split the bytes; an exclusive open makes the second one fail with a name instead.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
