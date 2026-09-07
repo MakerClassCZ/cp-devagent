@@ -216,11 +216,20 @@ async function saveToken(){                       // a fresh browser starts with
   await refresh(); await loadSnippets();
   if(CUR){ loadInfo(); listFiles(); }
 }
-function q(extra){ const p = new URLSearchParams(extra || {}); if(CUR) p.set("board", CUR); if(TOKENV) p.set("token", TOKENV); return p.toString(); }
+function q(extra, withToken){ const p = new URLSearchParams(extra || {}); if(CUR) p.set("board", CUR); if(withToken && TOKENV) p.set("token", TOKENV); return p.toString(); }
+/* The token travels in a header (fetch below adds it); it goes into a URL only where a header is
+   impossible - an <img src> and a download link - because URLs end up in history and logs. */
+const nativeFetch = window.fetch.bind(window);   // `let`, not a function declaration: that would
+let fetch = function(u, o){                       // replace window.fetch before nativeFetch is taken
+  o = Object.assign({}, o || {});
+  if(TOKENV) o.headers = Object.assign({}, o.headers || {}, {"X-Token": TOKENV});
+  return nativeFetch(u, o);
+};
 function human(n){ const u = ["B","KB","MB","GB"]; let i = 0;
   while(n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
   return (n < 10 && i ? n.toFixed(1) : Math.round(n)) + " " + u[i]; }
 function url(path, extra){ return path + (path.includes("?") ? "&" : "?") + q(extra); }
+function urlTok(path, extra){ return path + (path.includes("?") ? "&" : "?") + q(extra, true); }
 async function api(method, path, body){
   const r = await fetch(url(path), {method, body: body === undefined ? (method === "POST" ? "" : undefined) : body});
   const j = await r.json().catch(()=>({}));
@@ -330,7 +339,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function burl(id, path, extra){
   const p = new URLSearchParams(extra || {});
   p.set("board", id);
-  if(TOKENV) p.set("token", TOKENV);
   return path + "?" + p.toString();
 }
 function pumpAll(){
@@ -372,7 +380,7 @@ function tabs(){
 }
 async function refresh(){
   try{
-    const h = await (await fetch("/health?" + (TOKENV ? "token=" + TOKENV : ""))).json();
+    const h = await (await fetch("/health")).json();
     if(h.error){ AUTHED = false; $("p-agent").textContent = h.error; return; }
     AUTHED = true;
     BOARDS = h.boards || [];
@@ -420,7 +428,7 @@ async function refresh(){
   }catch(e){}
 }
 async function loadSnippets(){
-  const list = await (await fetch("/snippets?" + (TOKENV ? "token=" + TOKENV : ""))).json();
+  const list = await (await fetch("/snippets")).json();
   const box = $("snips"); box.innerHTML = "";
   if(!Array.isArray(list)){ box.innerHTML = '<span class="note">' + (list.error || "unavailable") + '</span>'; return; }
   for(const s of list){
@@ -477,7 +485,7 @@ addEventListener("DOMContentLoaded", () => {
 
 /* --- HDMI capture: an MJPEG stream straight into an <img>, no player --- */
 let VIDON = false;
-function videoUrl(){ return url("/video", {w: $("vidw").value, fps: $("vidfps").value, t: Date.now()}); }
+function videoUrl(){ return urlTok("/video", {w: $("vidw").value, fps: $("vidfps").value, t: Date.now()}); }
 function fit(){ $("vid").style.width = $("vid11").checked ? "auto" : "100%"; }
 function stopVideo(){                       // dropping the connection is what stops ffmpeg
   VIDON = false; const v = $("vid");
@@ -489,13 +497,13 @@ function toggleVideo(){
   v.style.display = ""; v.src = videoUrl(); $("vidbtn").textContent = "Stop"; fit();
 }
 function restartVideo(){ if(VIDON){ stopVideo(); toggleVideo(); } }
-function snapshot(){ window.open(url("/snapshot", {w: $("vidw").value, t: Date.now()}), "_blank"); }
+function snapshot(){ window.open(urlTok("/snapshot", {w: $("vidw").value, t: Date.now()}), "_blank"); }
              // a snapshot joins the running stream now, so it works while the panel is live
 
 /* --- add / edit board --- */
 function showApp(){ $("app").style.display = "grid"; $("addform").style.display = "none"; }
 async function editBoard(isNew){
-  DISCO = await (await fetch("/discover?" + (TOKENV ? "token=" + TOKENV : ""))).json();
+  DISCO = await (await fetch("/discover")).json();
   if(DISCO.error){ alert(DISCO.error); return; }
   DISCO.drives = DISCO.drives || []; DISCO.serial = DISCO.serial || []; DISCO.openocd_cfgs = DISCO.openocd_cfgs || [];
   const b = isNew ? {} : (BOARDS.find(x => x.id === CUR) || {});
@@ -549,14 +557,14 @@ async function saveBoard(){
                 video: $("f-video-manual").value.trim() || $("f-video").value || null,
                 video_size: $("f-video-size").value.trim() || null};
   if(!spec.id){ $("addnote").textContent = "an id is required"; return; }
-  const r = await fetch("/boards?" + (TOKENV ? "token=" + TOKENV : ""), {method:"POST", body: JSON.stringify(spec)});
+  const r = await fetch("/boards", {method:"POST", body: JSON.stringify(spec)});
   const j = await r.json();
   if(j.error){ $("addnote").textContent = j.error; return; }
   CUR = spec.id; showApp(); await refresh(); loadInfo(); listFiles();
 }
 async function removeBoard(){
   if(!CUR || !confirm("Forget board " + CUR + "? (the board itself is untouched)")) return;
-  await fetch("/boards?id=" + CUR + (TOKENV ? "&token=" + TOKENV : ""), {method:"DELETE"});
+  await fetch("/boards?" + new URLSearchParams({id: CUR}), {method:"DELETE"});
   CUR = null; await refresh(); if(CUR){ loadInfo(); listFiles(); }
 }
 
@@ -573,7 +581,7 @@ async function listFiles(){
     tr.innerHTML = e.dir
       ? `<td>📁 <a href="#" onclick="$('path').value='${full}';listFiles();return false">${e.name}/</a></td>
          <td class="sz"></td><td class="act"><button class="small" onclick="rmdir('${full}')">rm -r</button></td>`
-      : `<td><a href="${url("/file", {name: full})}" download>${e.name}</a></td>
+      : `<td><a href="${urlTok("/file", {name: full})}" download>${e.name}</a></td>
          <td class="sz">${e.size}</td><td class="act"><button class="small" onclick="rmFile('${full}')">delete</button></td>`;
     t.appendChild(tr);
   }

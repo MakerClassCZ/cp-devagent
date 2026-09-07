@@ -50,14 +50,13 @@ class Dev:
         extra = []
         if self.board:
             extra.append("board=" + quote(self.board))
-        if self.token:
-            extra.append("token=" + quote(self.token))
         if not extra:
             return self.base + path
         return self.base + path + ("&" if "?" in path else "?") + "&".join(extra)
 
     def _req(self, method, path, data=None, timeout=None, raw=False):
-        req = urllib.request.Request(self._url(path), data=data, method=method)
+        req = urllib.request.Request(self._url(path), data=data, method=method,
+                                     headers={"X-Token": self.token} if self.token else {})
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                 body = r.read()

@@ -3,8 +3,8 @@
 
 Start it with no arguments and add boards from the web panel at http://HOST:8100/ :
 
-    python devagent.py                       # panel on :8100, boards configured in the UI
-    python devagent.py --token secret        # same, but every request must carry the token
+    python devagent.py                       # panel on http://127.0.0.1:8100/, boards added in the UI
+    python devagent.py --bind 0.0.0.0 --token secret   # serve the network; the token is required
     python devagent.py --add jam:O:\\:COM4:rp2350   # optional: define a board on the CLI
 
 Boards live in devagent.json next to this file, so a restart brings them back. Each board keeps
@@ -52,12 +52,16 @@ Endpoints (all take ?board=<id>; with one board configured it is optional)
     POST   /shutdown                    clean exit
 """
 import argparse
+import ast
 import contextlib
 import errno
 import glob
 import hashlib
+import hmac
+import ipaddress
 import json
 import os
+import posixpath
 import re
 import select
 import shutil
@@ -79,6 +83,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "devagent.json")
 ARGS = None
 TOKEN = None
+TOKEN_FROM = None                             # where the token came from, for the startup line
 BOARDS = {}                                   # id -> Board
 BOARDS_LOCK = threading.Lock()
 
@@ -104,7 +109,9 @@ BOOTLOADER_MARKERS = ("RunMode.BOOTLOADER", "on_next_reset", "reset_to_bootloade
 def autorun_guard(name, body):
     """Refuse the boot loop: an auto-run file that asks for the bootloader re-enters it on
     every boot, and only a flash-erase UF2 gets you out. Returns why, or None if safe."""
-    if os.path.basename((name or "").replace("\\", "/")).lower() not in AUTORUN:
+    # the name the write will actually use: "code.py/" and "x/../code.py" are code.py too
+    base = posixpath.basename(posixpath.normpath("/" + (name or "").replace("\\", "/")))
+    if base.lower() not in AUTORUN:
         return None
     hits = [m for m in BOOTLOADER_MARKERS if m in body.decode("utf-8", "ignore")]
     if not hits:
@@ -229,6 +236,41 @@ def snippets():
     return out
 
 
+class DriveMissing(Exception):
+    """The board's drive is not there (unplugged, resetting, not mounted) or was refused."""
+
+
+def drive_check(path):
+    """Why `path` may not serve as a board's drive, or None when it may. POST /boards is
+    reachable by anything that can reach the agent, so the drive must be a CircuitPython
+    volume (boot_out.txt at its root, as circuitpy_drives() requires) and never a directory
+    that holds the host's own files - the home directory, this program, Python, a root."""
+    real = os.path.normcase(os.path.realpath(path))
+    guarded = [os.path.expanduser("~"), HERE, sys.prefix]
+    guarded.append(os.environ.get("SystemDrive", "C:") + "\\" if os.name == "nt" else "/")
+    for g in guarded:
+        g = os.path.normcase(os.path.realpath(g))
+        try:
+            if os.path.commonpath([real, g]) == real:
+                return "%s contains the host's own files (%s) - not a board drive" % (path, g)
+        except ValueError:                           # different Windows drives
+            continue
+    if not (ARGS and ARGS.any_path) and not os.path.isfile(os.path.join(path, "boot_out.txt")):
+        return ("%s has no boot_out.txt, so it is not a CircuitPython drive "
+                "(start with --any-path to serve a plain directory)" % path)
+    return None
+
+
+def normalize_drive_path(path):
+    """`O:` means "the current directory on O:" to Windows; a drive is `O:\\`."""
+    path = (path or "").strip()
+    if not path:
+        return None
+    if os.name == "nt" and re.fullmatch(r"[A-Za-z]:", path):
+        path += "\\"
+    return os.path.normpath(path)
+
+
 class Board:
     """One board: its drive, its console, its probe. All per-board state lives here so the
     agent can serve several at once without them stepping on each other."""
@@ -276,6 +318,7 @@ class Board:
     def status(self):
         self.relink()
         return dict(self.to_json(), drive=self.drive(), serial_open=self.serial_ok(),
+                    drive_problem=None if self.drive() else self.drive_problem(),
                     port_present=self.port_present,
                     openocd=self.ocd_running(), ocd_ports=self.ocd_ports(),
                     fs_mode=self.fs_mode(), in_bootloader=uf2_volume() is not None,
@@ -283,7 +326,19 @@ class Board:
 
     # ---- drive ----
     def drive(self):
-        return self.path if self.path and os.path.isdir(self.path) else None
+        """The board's drive when it is there AND is something a board may be pointed at
+        (drive_check) - never the host's own directories, whatever a request named."""
+        if not self.path or not os.path.isdir(self.path) or drive_check(self.path):
+            return None
+        return self.path
+
+    def drive_problem(self):
+        """Why drive() is None right now: absent, or refused (with the reason)."""
+        if not self.path:
+            return "no drive configured"
+        if not os.path.isdir(self.path):
+            return "drive not found: %s" % self.path
+        return drive_check(self.path)
 
     def fs_mode(self):
         if self.fs in ("msc", "repl"):
@@ -291,11 +346,22 @@ class Board:
         return "msc" if self.drive() else ("repl" if (cpfs and self.port) else "msc")
 
     def join(self, name):
+        """Host path of a file on the drive. Confined twice: lexically (no `..` out of the
+        drive) and through symlinks (the real path must stay under the real drive)."""
         drive = self.drive()
+        if drive is None:
+            raise DriveMissing(self.drive_problem())
+        root = os.path.realpath(drive)
         name = (name or "").replace("\\", "/").lstrip("/")
-        full = os.path.normpath(os.path.join(drive, name))
-        if os.path.commonpath([os.path.abspath(full), os.path.abspath(drive)]) != os.path.abspath(drive):
-            raise ValueError("path escapes the drive")
+        full = os.path.normpath(os.path.join(root, name))
+        for candidate in (full, os.path.realpath(full)):
+            try:
+                inside = os.path.commonpath([os.path.normcase(candidate),
+                                             os.path.normcase(root)]) == os.path.normcase(root)
+            except ValueError:                       # different Windows drives
+                inside = False
+            if not inside:
+                raise ValueError("path escapes the drive")
         return full
 
     # ---- identity ----
@@ -589,9 +655,12 @@ class Board:
         for line in out.splitlines():
             if line.startswith("DEVAGENT_INFO "):
                 try:
-                    info = eval(line[len("DEVAGENT_INFO "):], {"__builtins__": {}}, {})
+                    info = ast.literal_eval(line[len("DEVAGENT_INFO "):])   # never eval():
+                    if not isinstance(info, dict):                              # the board wrote it
+                        raise ValueError("not a dict")
                 except Exception as e:
-                    info = {"error": "could not parse: %r" % e, "raw_tail": out[-400:]}
+                    info = {"error": "the DEVAGENT_INFO line is not plain data (%s)"
+                                     % type(e).__name__, "raw_tail": out[-400:]}
                 break
         else:
             info["error"] = "no reply - is the board at a REPL prompt? (try a soft reboot)"
@@ -739,7 +808,7 @@ class Board:
             return {"error": "openocd not found on PATH (%s)" % ARGS.openocd}
         iface, target, speed = spec
         p = self.ocd_ports()
-        cmd = [ARGS.openocd, "-f", iface, "-f", target, "-c", speed, "-c", "bindto 0.0.0.0",
+        cmd = [ARGS.openocd, "-f", iface, "-f", target, "-c", speed, "-c", "bindto %s" % ARGS.ocd_bind,
                "-c", "gdb_port %d" % p["gdb"], "-c", "telnet_port %d" % p["telnet"],
                "-c", "tcl_port %d" % p["tcl"]]
         try:
@@ -1004,7 +1073,7 @@ def uf2_write(body, vol):
 
 # --------------------------------------------------------------- registry ----
 def load_config():
-    global TOKEN
+    global TOKEN, TOKEN_FROM
     cfg = {}
     if os.path.isfile(CONFIG):
         try:
@@ -1012,7 +1081,12 @@ def load_config():
                 cfg = json.load(f)
         except Exception as e:
             print("config unreadable (%r) - starting empty" % e)
-    TOKEN = ARGS.token or cfg.get("token") or None
+    # --token wins, and an explicit empty one (--token "") clears a persisted token
+    TOKEN = ARGS.token if ARGS.token is not None else cfg.get("token")
+    TOKEN = TOKEN or None
+    TOKEN_FROM = "--token / DEVAGENT_TOKEN" if ARGS.token else "devagent.json"
+    if ARGS.token is not None and TOKEN != (cfg.get("token") or None):
+        save_config()                            # a new or cleared token replaces the remembered one
     for i, b in enumerate(cfg.get("boards", [])):
         b.setdefault("index", i)
         try:
@@ -1029,6 +1103,10 @@ def save_config():
     tmp = CONFIG + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
+    try:
+        os.chmod(tmp, 0o600)                         # the token lives in here
+    except OSError:
+        pass
     os.replace(tmp, CONFIG)
 
 
@@ -1038,6 +1116,12 @@ def add_board(spec):
     bid = (spec.get("id") or "").strip()
     if not bid:
         raise ValueError("board id is required")
+    if spec.get("path") is not None:
+        spec["path"] = normalize_drive_path(spec["path"])
+        if spec["path"] and os.path.isdir(spec["path"]):
+            why = drive_check(spec["path"])
+            if why:
+                raise ValueError(why)
     with BOARDS_LOCK:
         old = BOARDS.pop(bid, None)
         if old:
@@ -1328,6 +1412,52 @@ def discover():
 
 
 # ---------------------------------------------------------------- server ----
+BODY_REQUIRED = ("/boards", "/serial/write", "/repl", "/uf2", "/ocd/cmd", "/ocd/flash", "/run")
+ALLOWED_HOSTS = set()                         # lower-case names this agent answers to (host_allowed)
+ALLOWED_ORIGINS = set()                       # lower-case foreign origins allowed to call the API
+
+
+def host_name(host):
+    """`Host: name:port` / `[v6]:port` -> the name."""
+    host = (host or "").strip()
+    if host.startswith("["):
+        return host[1:host.find("]")]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def host_allowed(host):
+    """A web page cannot pick the Host it sends unless its own name resolves to this machine
+    (DNS rebinding), so only names that are ours are answered: IP literals, localhost, this
+    machine's hostname / .local name and --allow-host extras. No Host at all is an HTTP/1.0
+    client, not a browser."""
+    name = host_name(host).lower().rstrip(".")
+    if not name or name in ALLOWED_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def local_names():
+    names = {"localhost"}
+    try:
+        h = socket.gethostname().lower()
+        names.update((h, h + ".local", h.split(".")[0], h.split(".")[0] + ".local"))
+        names.add(socket.getfqdn().lower())
+    except Exception:
+        pass
+    return names
+
+
+def is_loopback(bind):
+    try:
+        return bind in ("localhost", "") or ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        return False
+
+
 class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         # The browser aborts long-polls (tab switch), closes the snapshot tab mid-write, stops the
@@ -1340,20 +1470,29 @@ class Server(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    cors_origin = None                            # set by _gate() when a foreign origin is allowed
+
+    def _start(self, code, ctype, length=None, cache=None):
+        """Status + headers for every reply, so the CORS headers never get forgotten."""
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        if length is not None:
+            self.send_header("Content-Length", str(length))
+        if cache:
+            self.send_header("Cache-Control", cache)
+        if self.cors_origin:
+            self.send_header("Access-Control-Allow-Origin", self.cors_origin)
+            self.send_header("Vary", "Origin")
+        self.end_headers()
+
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
+        self._start(code, "application/json", len(body))
         self.wfile.write(body)
 
     def _text(self, code, s):
         body = s.encode("utf-8", "replace")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
+        self._start(code, "text/plain; charset=utf-8", len(body))
         self.wfile.write(body)
 
     def _client_gone(self):
@@ -1371,15 +1510,78 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _body(self):
-        return self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+    def _body(self, need=False):
+        """The request body, or None after an error reply has been sent. Only a body whose
+        length is declared is accepted: a chunked one would be read as empty and, for PUT
+        /file, written as an empty file and reported as verified."""
+        if self.headers.get("Transfer-Encoding"):
+            self._json(411, {"error": "chunked request bodies are not supported - "
+                                      "send a Content-Length"})
+            return None
+        length = self.headers.get("Content-Length")
+        if length is None:
+            if need:
+                self._json(411, {"error": "Content-Length required"})
+                return None
+            return b""
+        try:
+            n = int(length)
+            if n < 0:
+                raise ValueError
+        except ValueError:
+            self._json(400, {"error": "bad Content-Length"})
+            return None
+        if n > ARGS.max_body * 1024 * 1024:
+            self._json(413, {"error": "body larger than --max-body (%d MB)" % ARGS.max_body})
+            return None
+        data = self.rfile.read(n)
+        if len(data) != n:
+            self._json(400, {"error": "body shorter than Content-Length"})
+            return None
+        return data
 
-    def _authed(self, u, q):
-        """Token via header or query. The panel itself is served unauthenticated so the
-        browser can ask for the token; every data call is checked."""
-        if not TOKEN or u.path in ("/", "/ui.html"):
+    def _gate(self, u, q):
+        """Every request passes here first: is the Host one of ours (DNS rebinding), is the
+        Origin ours or allowed (a web page in the developer's browser must not be able to
+        write code.py or flash), and does it carry the token when one is set. The panel
+        page and /version are served without the token so a browser can ask for it."""
+        host = (self.headers.get("Host") or "").strip()
+        if not host_allowed(host):
+            self._json(403, {"error": "Host %r is not this agent - reach it by IP, localhost "
+                                      "or its hostname, or start with --allow-host %s"
+                                      % (host, host_name(host))})
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            o = origin.rstrip("/").lower()
+            if o in ALLOWED_ORIGINS:
+                self.cors_origin = origin
+            elif o != "http://" + host.lower():
+                self._json(403, {"error": "cross-origin request from %s refused; start with "
+                                          "--allow-origin %s to permit it" % (origin, origin)})
+                return False
+        if not TOKEN or u.path in ("/", "/ui.html", "/version"):
             return True
-        return (self.headers.get("X-Token") == TOKEN) or ((q.get("token") or [None])[0] == TOKEN)
+        given = self.headers.get("X-Token") or (q.get("token") or [""])[0] or ""
+        if hmac.compare_digest(given.encode("utf-8"), TOKEN.encode("utf-8")):
+            return True
+        self._json(401, {"error": "token required"})
+        return False
+
+    def do_OPTIONS(self):
+        """CORS preflight for an --allow-origin page (X-Token / PUT trigger one)."""
+        u = urlparse(self.path)
+        origin = (self.headers.get("Origin") or "").rstrip("/").lower()
+        if origin not in ALLOWED_ORIGINS:
+            return self._json(403, {"error": "origin not allowed"})
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin"))
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "X-Token, Content-Type")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin")
+        self.end_headers()
 
     def _board(self, q):
         b = pick_board(q)
@@ -1391,18 +1593,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        if not self._authed(u, q):
-            return self._json(401, {"error": "token required"})
+        if not self._gate(u, q):
+            return
         if u.path in ("/", "/ui.html"):
             try:
                 with open(os.path.join(HERE, "ui.html"), "rb") as f:
                     page = f.read()
             except Exception as e:
                 return self._text(500, "ui.html not found next to devagent.py (%r)" % e)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(page)))
-            self.end_headers()
+            self._start(200, "text/html; charset=utf-8", len(page))
             self.wfile.write(page)
             return
         if u.path == "/version":
@@ -1456,18 +1655,11 @@ class Handler(BaseHTTPRequestHandler):
                                                    " (capture size %s - clear it if the card "
                                                    "cannot do that mode)" % cap.size
                                                    if cap.size else "")})
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/jpeg")
-                    self.send_header("Content-Length", str(len(jpg)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
+                    self._start(200, "image/jpeg", len(jpg), cache="no-store")
                     self.wfile.write(jpg)
                     return
                 # MJPEG: the browser shows this straight in an <img>, no player needed
-                self.send_response(200)
-                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
+                self._start(200, "multipart/x-mixed-replace; boundary=frame", cache="no-store")
                 seq = -1
                 while True:
                     jpg, seq = cap.wait_frame(seq, 15)
@@ -1484,7 +1676,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/info":
             return self._json(200, b.get_info(q.get("refresh", ["0"])[0] not in ("0", "")))
         if b.drive() is None and b.fs_mode() != "repl":
-            return self._json(503, {"error": "drive not found: %s" % b.path})
+            return self._json(503, {"error": b.drive_problem()})
         try:
             if u.path == "/free":
                 st = shutil.disk_usage(b.drive())
@@ -1494,10 +1686,7 @@ class Handler(BaseHTTPRequestHandler):
                                               q.get("recursive", ["0"])[0] not in ("0", "")))
             if u.path == "/file":
                 data = b.read(q["name"][0])
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
+                self._start(200, "application/octet-stream", len(data))
                 self.wfile.write(data)
                 return
         except Exception as e:
@@ -1507,15 +1696,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        if not self._authed(u, q):
-            return self._json(401, {"error": "token required"})
+        if not self._gate(u, q):
+            return
         if u.path != "/file":
             return self._json(404, {"error": "unknown path"})
         b = self._board(q)
         if b is None:
             return
+        body = self._body(need=True)
+        if body is None:
+            return
         try:
-            name, body = q["name"][0], self._body()
+            name = q["name"][0]
             if q.get("force", ["0"])[0] in ("0", ""):
                 why = autorun_guard(name, body)
                 if why:
@@ -1527,8 +1719,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        if not self._authed(u, q):
-            return self._json(401, {"error": "token required"})
+        if not self._gate(u, q):
+            return
         if u.path == "/boards":
             bid = (q.get("id") or [None])[0]
             return self._json(200, {"removed": bool(bid and drop_board(bid))})
@@ -1549,9 +1741,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        if not self._authed(u, q):
-            return self._json(401, {"error": "token required"})
-        body = self._body()
+        if not self._gate(u, q):
+            return
+        body = self._body(need=u.path in BODY_REQUIRED)
+        if body is None:
+            return
         if u.path == "/shutdown":
             threading.Thread(target=lambda: (time.sleep(0.2), os._exit(0)), daemon=True).start()
             return self._json(200, {"shutdown": True})
@@ -1682,10 +1876,31 @@ def main():
         sys.stdout.reconfigure(line_buffering=True)   # so a redirected log is live, not buffered
     except Exception:
         pass
+    if sys.version_info < (3, 7):
+        print("devagent needs Python 3.7 or newer (this is %s)" % sys.version.split()[0])
+        return 1
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8100)
-    ap.add_argument("--bind", default="0.0.0.0")
-    ap.add_argument("--token", default=None, help="require this token on every data request")
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="address to listen on (default: this machine only; 0.0.0.0 = the "
+                         "network, which needs --token)")
+    ap.add_argument("--token", default=os.environ.get("DEVAGENT_TOKEN"),
+                    help="require this token on every data request (also $DEVAGENT_TOKEN; "
+                         "remembered in devagent.json, --token '' forgets it)")
+    ap.add_argument("--open", action="store_true",
+                    help="serve the network WITHOUT a token - only on a network you trust")
+    ap.add_argument("--allow-origin", action="append", default=[], metavar="URL",
+                    help="a web origin (https://site.example) allowed to call the API from "
+                         "the browser, besides the panel itself; repeatable")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="an extra hostname this agent answers to (a DNS alias); repeatable")
+    ap.add_argument("--any-path", action="store_true",
+                    help="let a board's drive be a plain directory (no boot_out.txt), for "
+                         "testing without hardware")
+    ap.add_argument("--max-body", type=int, default=64, metavar="MB",
+                    help="largest request body accepted (files, firmware); default 64")
+    ap.add_argument("--ocd-bind", default="127.0.0.1", metavar="ADDR",
+                    help="address OpenOCD's gdb/telnet/tcl ports listen on (default: local)")
     ap.add_argument("--openocd", default="openocd")
     ap.add_argument("--ffmpeg", default="ffmpeg",
                     help="ffmpeg used for HDMI-capture video (a board's 'video' device)")
@@ -1695,6 +1910,9 @@ def main():
     ap.add_argument("--replace", action="store_true",
                     help="if another devagent holds the port, ask it to exit and take over")
     ARGS = ap.parse_args()
+    ALLOWED_HOSTS.update(local_names())
+    ALLOWED_HOSTS.update(h.lower() for h in ARGS.allow_host)
+    ALLOWED_ORIGINS.update(o.rstrip("/").lower() for o in ARGS.allow_origin)
 
     who = probe_existing(ARGS.port)
     if who:
@@ -1703,7 +1921,8 @@ def main():
             try:
                 import urllib.request
                 urllib.request.urlopen(urllib.request.Request(
-                    "http://127.0.0.1:%d/shutdown" % ARGS.port, data=b"", method="POST"), timeout=3)
+                    "http://127.0.0.1:%d/shutdown" % ARGS.port, data=b"", method="POST",
+                    headers={"X-Token": ARGS.token or ""}), timeout=3)
             except Exception:
                 pass
             time.sleep(1.0)
@@ -1716,6 +1935,11 @@ def main():
             return 1
 
     load_config()
+    if not is_loopback(ARGS.bind) and not TOKEN and not ARGS.open:
+        print("ERROR: --bind %s serves the network, and there is no token: anyone who can reach "
+              "this machine could write files and flash firmware." % ARGS.bind)
+        print("       Add --token SECRET (or DEVAGENT_TOKEN), or --open on a network you trust.")
+        return 1
     for spec in ARGS.add:
         parts = spec.split(":")
         # a Windows drive carries its own colon (O:\), so rebuild it when splitting
@@ -1741,8 +1965,12 @@ def main():
         print("  (pyserial missing - consoles disabled; pip install pyserial)")
     if cpfs is None:
         print("  (cpfs.py missing - REPL file access unavailable for boards without a drive)")
-    print("  auth: %s" % ("token required" if TOKEN else "OPEN - anyone on this network can "
-                          "write files and flash firmware (use --token)"))
+    if TOKEN:
+        print("  auth: token required (%s)" % TOKEN_FROM)
+    elif is_loopback(ARGS.bind):
+        print("  auth: none - reachable from this machine only")
+    else:
+        print("  auth: OPEN (--open) - anyone on this network can write files and flash firmware")
     try:
         srv = Server((ARGS.bind, ARGS.port), Handler)
     except OSError as e:
