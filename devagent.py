@@ -1990,6 +1990,11 @@ class Handler(BaseHTTPRequestHandler):
         self._start(code, "application/json", len(body))
         self.wfile.write(body)
 
+    def _result(self, res, failed=503):
+        """A board operation's result dict: 200, or `failed` when it reports an error - so a
+        caller that only looks at the status still learns that nothing happened."""
+        return self._json(failed if res.get("error") else 200, res)
+
     def _text(self, code, s):
         body = s.encode("utf-8", "replace")
         self._start(code, "text/plain; charset=utf-8", len(body))
@@ -2185,7 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 cap.release()
         if u.path == "/info":
-            return self._json(200, b.get_info(qflag(q, "refresh")))
+            return self._result(b.get_info(qflag(q, "refresh")))
         if u.path == "/free":
             st = shutil.disk_usage(b.join(""))    # join() says 503 when the drive is gone
             return self._json(200, {"free": st.free, "total": st.total, "used": st.used})
@@ -2252,7 +2257,7 @@ class Handler(BaseHTTPRequestHandler):
             mode = qstr(q, "mode", "soft")
             if mode not in ("soft", "hard"):
                 raise BadRequest("?mode must be soft or hard")
-            return self._json(200, b.reset(mode))
+            return self._result(b.reset(mode))
         if u.path == "/repl":
             out = b.run_repl(body.decode("utf-8", "replace"), qint(q, "ms", 6000, 0, MS_MAX))
             return self._json(200, {"output": out})
@@ -2276,7 +2281,7 @@ class Handler(BaseHTTPRequestHandler):
             b.send(b"\x04")
             return self._json(200, {"rebooted": True})
         if u.path == "/bootloader/enter":
-            return self._json(200, b.bootloader_enter(bl_method(q), qfloat(q, "timeout", 20, 0, 300)))
+            return self._result(b.bootloader_enter(bl_method(q), qfloat(q, "timeout", 20, 0, 300)))
         if u.path == "/uf2":
             if body[:4] != b"UF2\n":
                 return self._json(400, {"error": "body is not a UF2 image (bad magic)"})
@@ -2295,7 +2300,7 @@ class Handler(BaseHTTPRequestHandler):
                 res["drive_back"] = wait_for(b.drive, qfloat(q, "wait_s", 25, 0, 300))
             return self._json(200, res)
         if u.path == "/ocd/start":
-            return self._json(200, b.ocd_start(qstr(q, "cfg", "") or None))
+            return self._result(b.ocd_start(qstr(q, "cfg", "") or None))
         if u.path == "/ocd/stop":
             return self._json(200, b.ocd_stop())
         if u.path == "/ocd/cmd":
@@ -2306,8 +2311,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/ocd/flash":
             if not body:
                 return self._json(400, {"error": "body must be the firmware image"})
-            return self._json(200, b.ocd_flash(body, qflag(q, "verify", True),
-                                               qflag(q, "reset", True)))
+            return self._result(b.ocd_flash(body, qflag(q, "verify", True),
+                                            qflag(q, "reset", True)), failed=502)
         if u.path == "/mkdir":
             name = qstr(q, "name")
             b.mkdir(name)
