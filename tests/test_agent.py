@@ -216,6 +216,23 @@ class Console(unittest.TestCase):
         self.assertIn("soft reboot", j["output"]); self.assertIn("code.py line 2", j["output"])
         req("DELETE", "/file?board=fake&name=code.py")
 
+    def test_repl_while_code_runs(self):
+        """Ctrl-C into a running code.py lands on "Press any key to enter the REPL"; the script
+        must still arrive in paste mode (the any-key byte used to eat Ctrl-E)."""
+        req("POST", "/serial/write?board=fake", b"\x04")     # reboot: code.py runs for ~2 s
+        time.sleep(0.3)
+        out, took = self.repl("OUT while\nOUT  indented")
+        self.assertIn("while", out); self.assertIn("indented", out)
+        self.assertLess(took, 4)
+
+    def test_repl_from_press_any_key(self):
+        """code.py finished on its own: the board sits at the any-key question."""
+        req("POST", "/serial/write?board=fake", b"\x04")
+        time.sleep(2.6)                                     # let the fake's code.py end
+        status, j = req("GET", "/serial/tail?board=fake&from=-1&ms=0")
+        out, _ = self.repl("OUT afterwards")
+        self.assertIn("afterwards", out)
+
     def test_read_longpoll_returns_when_the_board_prints(self):
         req("GET", "/serial/read?board=fake&ms=0")           # drain what is pending
         t = time.time()
@@ -256,6 +273,21 @@ class Registry(unittest.TestCase):
         for i in range(8):
             self.assertEqual(req("DELETE", "/boards?id=b%d" % i)[1], {"removed": True})
         self.assertEqual(len(req("GET", "/boards")[1]), 1)
+
+    def test_editing_nothing_changes_nothing(self):
+        """POST /boards with just the id (the client's bare `board`) must not rebuild the board:
+        it used to close the console and stop openocd for a no-op edit."""
+        status, before = req("GET", "/boards")
+        fake = next(b for b in before if b["id"] == "fake")
+        req("POST", "/serial/write?board=fake", b"\x03")
+        time.sleep(0.3)
+        status, tail = req("GET", "/serial/tail?board=fake&from=-1&ms=0")
+        status, j = req("POST", "/boards", json.dumps({"id": "fake"}).encode())
+        self.assertEqual(status, 200)
+        self.assertEqual({k: j[k] for k in fake if k in j}, {k: fake[k] for k in fake if k in j})
+        status, again = req("GET", "/serial/tail?board=fake&from=%d&ms=0" % tail["next"])
+        self.assertGreaterEqual(again["next"], tail["next"], "a rebuilt board restarts its "
+                                "console log at 0 - the cursor must not go backwards")
 
     def test_index_as_digit_string(self):
         status, j = req("POST", "/boards", b'{"id":"fake","index":"3"}')

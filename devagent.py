@@ -114,6 +114,14 @@ def repl_done(text):
 def code_done(text):
     """True once CircuitPython says the program in code.py finished."""
     return "Code done running." in text
+
+
+PRESS_ANY_KEY = "Press any key to enter the REPL"    # what a finished/interrupted code.py shows
+
+
+def at_prompt(text):
+    """True when the board's last words are the REPL prompt."""
+    return text.rstrip().endswith(">>>")
 _FFMPEG_OK = None                                    # ffmpeg present? probed once
 OCD_CFGS = {
     "rp2350": ("interface/cmsis-dap.cfg", "target/rp2350.cfg", "adapter speed 5000"),
@@ -663,21 +671,25 @@ class Board:
                 if exclusive:
                     self.exclusive = max(0, self.exclusive - 1)
 
-    def collect(self, sink, ms, done=None):
-        """Read a tap for `ms`; return earlier only when `done(text)` says the run is over.
-        (It used to stop after 0.4 s of silence, which cut off `print; sleep(1); print` after
-        the first line and handed a slow script's output to whoever asked next.)"""
-        deadline, seen = time.time() + ms / 1000.0, 0
+    def wait_console(self, sink, ms, done):
+        """Wait up to `ms` for `done(text)` to hold on what the tap has gathered. True if it did."""
+        deadline, seen = time.time() + ms / 1000.0, -1
         while True:
             with self.wake:
                 if len(sink) > seen:
                     seen = len(sink)
-                    if done and done("".join(sink)):
-                        break
+                    if done("".join(sink)):
+                        return True
                 left = deadline - time.time()
                 if left <= 0:
-                    break
+                    return False
                 self.wake.wait(min(0.25, left))
+
+    def collect(self, sink, ms, done=None):
+        """Read a tap for `ms`; return earlier only when `done(text)` says the run is over.
+        (It used to stop after 0.4 s of silence, which cut off `print; sleep(1); print` after
+        the first line and handed a slow script's output to whoever asked next.)"""
+        self.wait_console(sink, ms, done or (lambda text: False))
         with self.buf_lock:
             return "".join(sink)
 
@@ -790,9 +802,18 @@ class Board:
         with self.repl_lock:                              # two scripts at once would interleave
             with self.tap(exclusive=True) as sink:
                 self.send_or_raise(b"\x03")
-                time.sleep(0.25)
+                # A board running code.py answers Ctrl-C with a traceback and "Press any key to
+                # enter the REPL" - and the next byte, whatever it is, only enters the REPL. Sent
+                # blind after a fixed pause, Ctrl-E was that byte: no paste mode, and the script
+                # went line by line into the plain prompt (a SyntaxError at the first indented
+                # line, seen on a Fruit Jam mid-game). So wait for the prompt, answer the any-key
+                # question with a bare Enter if that is what came, and wait for the prompt again.
+                if (self.wait_console(sink, 3000, lambda t: at_prompt(t) or PRESS_ANY_KEY in t)
+                        and not at_prompt("".join(sink))):
+                    self.send_or_raise(b"\r")
+                    self.wait_console(sink, 3000, at_prompt)
                 self.send_or_raise(b"\x05")               # Ctrl-E: paste mode
-                time.sleep(0.15)
+                self.wait_console(sink, 1000, lambda t: t.rstrip().endswith("==="))
                 marked = 'print("%s")\n%s' % (REPL_MARK, code)
                 self.send_or_raise(marked.replace("\r\n", "\n").replace("\n", "\r").encode())
                 time.sleep(0.1)
@@ -1463,7 +1484,9 @@ def save_config():
 
 def add_board(spec):
     """spec: dict from the UI/CLI. Re-adding an id edits it in place: keys left out keep their
-    value, an explicit null clears one - so {"id": "jam", "port": "COM7"} is a complete edit."""
+    value, an explicit null clears one - so {"id": "jam", "port": "COM7"} is a complete edit.
+    A real change rebuilds the board (its console reopens, its openocd stops); a spec that
+    changes nothing leaves it alone - {"id": "jam"} used to restart everything for no reason."""
     bid = (spec.get("id") or "").strip()
     if not bid:
         raise ValueError("board id is required")
@@ -1488,6 +1511,8 @@ def add_board(spec):
                     ocd=spec.get("ocd"), fs=spec.get("fs", "auto"),
                     video=spec.get("video"), video_size=spec.get("video_size"),
                     index=idx, uid=spec.get("uid"))   # raises on a bad value: old stays as it was
+        if old and new.to_json() == old.to_json():
+            return old                               # nothing changed: keep the console and openocd
         BOARDS[bid] = new
     if old:
         retire(old)
