@@ -86,7 +86,8 @@ ARGS = None
 TOKEN = None
 TOKEN_FROM = None                             # where the token came from, for the startup line
 BOARDS = {}                                   # id -> Board
-BOARDS_LOCK = threading.Lock()
+BOARDS_LOCK = threading.Lock()                # held while BOARDS is read or changed (never nested)
+SAVE_LOCK = threading.Lock()                  # one config writer at a time
 
 try:
     import serial                             # pyserial
@@ -294,17 +295,36 @@ class Board:
 
     def __init__(self, id, label=None, path=None, port=None, baud=115200,
                  ocd=None, index=0, fs="auto", video=None, video_size=None, uid=None):
-        self.id = id
-        self.label = label or id
-        self.path = path or None
-        self.port = port or None
-        self.baud = int(baud or 115200)
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("board id is required")
+        self.id = id.strip()
+        if not re.fullmatch(r"[\w.-]{1,40}", self.id):    # it lives in URLs and the config
+            raise ValueError("board id %r: letters, digits, . _ - only" % self.id)
+        self.label = str(label or self.id)
+        self.path = str(path) if path else None
+        self.port = str(port) if port else None
+        try:
+            self.baud = int(baud or 115200)
+            self.index = int(index or 0)             # decides this board's OpenOCD ports
+        except (TypeError, ValueError):
+            raise ValueError("baud and index must be integers")
+        if not 300 <= self.baud <= 4000000:
+            raise ValueError("baud %d is not a serial speed" % self.baud)
+        if not 0 <= self.index < 64:
+            raise ValueError("index must be 0..63 (it picks the OpenOCD ports)")
         self.ocd = ocd or None                       # None | "rp2040" | "rp2350"
+        if self.ocd is not None and self.ocd not in OCD_CFGS:
+            raise ValueError("ocd must be one of %s" % sorted(OCD_CFGS))
         self.fs = fs or "auto"
-        self.video = video or None                   # HDMI capture: dshow name / /dev/videoN / "test"
-        self.video_size = video_size or None         # exact capture mode, e.g. "640x480"
-        self.index = index                           # decides this board's OpenOCD ports
-        self.uid = uid or None                       # boot_out.txt UID == USB serial number; see relink()
+        if self.fs not in ("auto", "msc", "repl"):
+            raise ValueError("fs must be auto, msc or repl")
+        self.video = str(video) if video else None   # HDMI capture: dshow name / /dev/videoN / "test"
+        self.video_size = str(video_size) if video_size else None   # capture mode, e.g. "640x480"
+        if self.video_size and not re.fullmatch(r"\d+x\d+", self.video_size):
+            raise ValueError("video_size must look like 640x480")
+        self.uid = (str(uid).upper() or None) if uid else None   # boot_out.txt UID == USB serial
+        self.dead = False                            # replaced or removed: reader exits, no reopen
+        self._uid_seen = (None, 0.0, None)           # (path, when, uid on it) - see drive_uid()
         self.port_present = None                     # last relink() verdict: None = not checked yet
         self._relink_at = 0.0
         self._relink_lock = threading.Lock()
@@ -338,18 +358,30 @@ class Board:
         self.relink()
         return dict(self.to_json(), drive=self.drive(), serial_open=self.serial_ok(),
                     drive_problem=None if self.drive() else self.drive_problem(),
-                    port_present=self.port_present,
+                    port_present=self.port_present, reader_alive=self.reader_alive(),
                     openocd=self.ocd_running(), ocd_ports=self.ocd_ports(),
                     fs_mode=self.fs_mode(), in_bootloader=uf2_volume() is not None,
                     ffmpeg=have_ffmpeg())
 
     # ---- drive ----
     def drive(self):
-        """The board's drive when it is there AND is something a board may be pointed at
-        (drive_check) - never the host's own directories, whatever a request named."""
+        """The board's drive when it is there, is something a board may be pointed at
+        (drive_check - never the host's own directories, whatever a request named), and
+        still carries THIS board's UID: after a re-plug the same letter can be another board,
+        and a write must not land there."""
         if not self.path or not os.path.isdir(self.path) or drive_check(self.path):
             return None
+        if self.uid and self.drive_uid() not in (None, self.uid):
+            return None
         return self.path
+
+    def drive_uid(self):
+        """UID in boot_out.txt on self.path (None when it has none), re-read at most once a
+        second - drive() is asked per file operation."""
+        now = time.time()
+        if self._uid_seen[0] != self.path or now - self._uid_seen[1] > 1.0:
+            self._uid_seen = (self.path, now, (drive_identity(self.path) or {}).get("uid"))
+        return self._uid_seen[2]
 
     def drive_problem(self):
         """Why drive() is None right now: absent, or refused (with the reason)."""
@@ -357,7 +389,13 @@ class Board:
             return "no drive configured"
         if not os.path.isdir(self.path):
             return "drive not found: %s" % self.path
-        return drive_check(self.path)
+        why = drive_check(self.path)
+        if why:
+            return why
+        if self.uid and self.drive_uid() not in (None, self.uid):
+            return "%s now belongs to another board (UID %s, this one is %s)" % (
+                self.path, self.drive_uid(), self.uid)
+        return None
 
     def fs_mode(self):
         if self.fs in ("msc", "repl"):
@@ -400,8 +438,8 @@ class Board:
         try:
             self._relink_at = now
             moved, changed = [], False
-            drive = self.drive()
-            drive_uid = (drive_identity(drive) or {}).get("uid") if drive else None
+            self._uid_seen = (None, 0.0, None)                     # look afresh, not at the cache
+            drive_uid = self.drive_uid() if self.path and os.path.isdir(self.path) else None
             ports = None
             if self.port and serial is not None and (self.ser is None or self.uid is None):
                 ports = {p.device: p for p in comports()}
@@ -411,7 +449,8 @@ class Board:
                 if learnt:
                     self.uid, changed = learnt.upper(), True
             if self.uid:
-                others = [b for b in BOARDS.values() if b is not self]
+                with BOARDS_LOCK:
+                    others = [b for b in BOARDS.values() if b is not self]
                 if self.path and drive_uid != self.uid:            # gone, or the letter went elsewhere
                     taken = {b.path for b in others}
                     for cand in circuitpy_drives():
@@ -432,12 +471,18 @@ class Board:
                                 self.close_serial()
                                 self.port = dev
                                 break
-            if ports is not None:
-                self.port_present = self.port in ports
+            if ports is not None:                                  # present = there AND ours
+                here = ports.get(self.port)
+                here_uid = (here.serial_number or "").upper() if here else None
+                self.port_present = here is not None and (not self.uid or not here_uid
+                                                          or here_uid == self.uid)
             elif self.ser is not None:
                 self.port_present = True
             if moved or changed:
-                save_config()
+                try:
+                    save_config()
+                except OSError as e:
+                    self.note("could not save devagent.json: %s" % e)
             for m in moved:
                 self.note("%s (same board, UID %s)" % (m, self.uid))
                 print("[%s] %s" % (self.id, m))
@@ -456,7 +501,7 @@ class Board:
             return self.open_serial() is not None
 
     def open_serial(self):
-        if serial is None or not self.port:
+        if serial is None or not self.port or self.dead:
             return None
         if self.ser is not None and getattr(self.ser, "is_open", False):
             return self.ser
@@ -484,25 +529,33 @@ class Board:
 
     def _read_loop(self):
         """A board prints whether or not anyone is listening; keep the tail."""
-        while True:
-            if BOARDS.get(self.id) is not self:      # forgotten or replaced: stop the thread
-                return
-            with self.ser_lock:
-                s = self.open_serial()
-                data = b""
-                if s is not None:
-                    try:
-                        n = s.in_waiting
-                        data = s.read(n if n else 1)
-                    except Exception:
-                        self.ser = None
-            if data:
-                self._ingest(data.decode("utf-8", "replace"))
-            elif s is None:
-                self.relink()                        # the port may be back under another name
-                time.sleep(0.5)                      # no port: don't spin on a failing open()
-            else:
-                time.sleep(0.005)                    # the blocking read above does the pacing
+        while not self.dead:
+            try:
+                self._read_once()
+            except Exception as e:                   # a dead reader would look like a silent
+                self.note("console reader: %r" % e)  # board; log it and carry on
+                time.sleep(0.5)
+
+    def _read_once(self):
+        with self.ser_lock:
+            s = self.open_serial()
+            data = b""
+            if s is not None:
+                try:
+                    n = s.in_waiting
+                    data = s.read(n if n else 1)
+                except Exception:
+                    self.ser = None
+        if data:
+            self._ingest(data.decode("utf-8", "replace"))
+        elif s is None:
+            self.relink()                        # the port may be back under another name
+            time.sleep(0.5)                      # no port: don't spin on a failing open()
+        else:
+            time.sleep(0.005)                    # the blocking read above does the pacing
+
+    def reader_alive(self):
+        return self._reader is not None and self._reader.is_alive()
 
     def _ingest(self, text, to_taps=True):
         with self.buf_lock:
@@ -1152,16 +1205,24 @@ def load_config():
 
 
 def save_config():
-    with BOARDS_LOCK:
-        data = {"token": TOKEN, "boards": [b.to_json() for b in BOARDS.values()]}
-    tmp = CONFIG + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=1)
-    try:
-        os.chmod(tmp, 0o600)                         # the token lives in here
-    except OSError:
-        pass
-    os.replace(tmp, CONFIG)
+    """Atomic rewrite of devagent.json. Serialised: every board's first relink() saves, and
+    two writers sharing one temp name lost the file (FileNotFoundError on the replace)."""
+    with SAVE_LOCK:
+        with BOARDS_LOCK:
+            data = {"token": TOKEN, "boards": [b.to_json() for b in BOARDS.values()]}
+        fd, tmp = tempfile.mkstemp(prefix="devagent.json.", dir=HERE)   # mode 600: the token
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def add_board(spec):
@@ -1177,48 +1238,57 @@ def add_board(spec):
             if why:
                 raise ValueError(why)
     with BOARDS_LOCK:
-        old = BOARDS.pop(bid, None)
+        old = BOARDS.get(bid)
         if old:
-            old.close_serial()
-            old.ocd_stop()
             spec = dict(old.to_json(), **spec)
             if spec.get("port") != old.port or spec.get("path") != old.path:
                 spec["uid"] = None                   # pointed at other hardware: learn its UID afresh
         idx = spec.get("index")
         if idx is None:
-            used = {b.index for b in BOARDS.values()}
+            used = {b.index for b in BOARDS.values() if b is not old}
             idx = next(i for i in range(64) if i not in used)
-        BOARDS[bid] = Board(id=bid, label=spec.get("label"), path=spec.get("path"),
-                            port=spec.get("port"), baud=spec.get("baud", 115200),
-                            ocd=spec.get("ocd"), fs=spec.get("fs", "auto"),
-                            video=spec.get("video"), video_size=spec.get("video_size"),
-                            index=idx, uid=spec.get("uid"))
-        BOARDS[bid].start_reader()                   # only now: the board is registered
+        new = Board(id=bid, label=spec.get("label"), path=spec.get("path"),
+                    port=spec.get("port"), baud=spec.get("baud", 115200),
+                    ocd=spec.get("ocd"), fs=spec.get("fs", "auto"),
+                    video=spec.get("video"), video_size=spec.get("video_size"),
+                    index=idx, uid=spec.get("uid"))   # raises on a bad value: old stays as it was
+        BOARDS[bid] = new
+    if old:
+        retire(old)
+    new.start_reader()                               # only now: the board is registered
     save_config()
-    return BOARDS[bid]
+    return new
+
+
+def retire(board):
+    """A board taken out of BOARDS: its reader must stop and never reopen the port."""
+    board.dead = True
+    board.close_serial()
+    board.ocd_stop()
 
 
 def drop_board(bid):
     with BOARDS_LOCK:
         b = BOARDS.pop(bid, None)
     if b:
-        b.close_serial()
-        b.ocd_stop()
+        retire(b)
     save_config()
     return b is not None
 
 
 def boards_ordered():
-    return sorted(BOARDS.values(), key=lambda b: (b.index, b.id))
+    with BOARDS_LOCK:
+        return sorted(BOARDS.values(), key=lambda b: (b.index, b.id))
 
 
 def pick_board(q):
     """?board=id, or the only one configured. Never guesses between several."""
     bid = (q.get("board") or [None])[0]
-    if bid:
-        return BOARDS.get(bid)
-    if len(BOARDS) == 1:
-        return next(iter(BOARDS.values()))
+    with BOARDS_LOCK:
+        if bid:
+            return BOARDS.get(bid)
+        if len(BOARDS) == 1:
+            return next(iter(BOARDS.values()))
     return None
 
 
@@ -1640,8 +1710,9 @@ class Handler(BaseHTTPRequestHandler):
     def _board(self, q):
         b = pick_board(q)
         if b is None:
-            self._json(404, {"error": "no such board; pass ?board=<id> (configured: %s)"
-                             % sorted(BOARDS)})
+            with BOARDS_LOCK:
+                known = sorted(BOARDS)
+            self._json(404, {"error": "no such board; pass ?board=<id> (configured: %s)" % known})
         return b
 
     def do_GET(self):
@@ -1902,6 +1973,23 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "unknown path"})
 
 
+def parse_add(spec):
+    """'ID key=value key=value' (whitespace- or comma-separated) -> a board spec dict."""
+    words = [w for w in re.split(r"[\s,]+", spec.strip()) if w]
+    if not words:
+        raise ValueError("empty")
+    if "=" not in words[0]:
+        words[0] = "id=" + words[0]
+    keys = ("id", "label", "path", "port", "baud", "ocd", "fs", "index", "video", "video_size")
+    d = {}
+    for w in words:
+        key, eq, val = w.partition("=")
+        if not eq or key not in keys:
+            raise ValueError("expected key=value with a key from %s, got %r" % (keys, w))
+        d[key] = val
+    return d
+
+
 def probe_existing(port):
     try:
         import urllib.request
@@ -1955,9 +2043,11 @@ def main():
     ap.add_argument("--openocd", default="openocd")
     ap.add_argument("--ffmpeg", default="ffmpeg",
                     help="ffmpeg used for HDMI-capture video (a board's 'video' device)")
-    ap.add_argument("--add", action="append", default=[],
-                    help="id:drive:serial[:ocdcfg], e.g. jam:O:\\:COM4:rp2350 (optional; "
-                         "boards are normally added in the web panel)")
+    ap.add_argument("--add", action="append", default=[], metavar="SPEC",
+                    help="add or edit a board from the command line: 'ID key=value ...' with "
+                         "the keys of the panel form (path, port, baud, ocd, fs, index, video, "
+                         "video_size, label), e.g. 'jam path=O:\\ port=COM4 ocd=rp2350'; "
+                         "repeatable")
     ap.add_argument("--replace", action="store_true",
                     help="if another devagent holds the port, ask it to exit and take over")
     ARGS = ap.parse_args()
@@ -1992,18 +2082,11 @@ def main():
         print("       Add --token SECRET (or DEVAGENT_TOKEN), or --open on a network you trust.")
         return 1
     for spec in ARGS.add:
-        parts = spec.split(":")
-        # a Windows drive carries its own colon (O:\), so rebuild it when splitting
-        if len(parts) >= 3 and len(parts[1]) == 1 and parts[2].startswith("\\"):
-            parts = [parts[0], parts[1] + ":" + parts[2]] + parts[3:]
-        d = {"id": parts[0]}
-        if len(parts) > 1 and parts[1]:
-            d["path"] = parts[1]
-        if len(parts) > 2 and parts[2]:
-            d["port"] = parts[2]
-        if len(parts) > 3 and parts[3]:
-            d["ocd"] = parts[3]
-        add_board(d)
+        try:
+            add_board(parse_add(spec))
+        except ValueError as e:
+            print("ERROR: --add %r: %s" % (spec, e))
+            return 1
 
     print("devagent v%d on %s:%d  (%d board%s configured)"
           % (AGENT_VERSION, ARGS.bind, ARGS.port, len(BOARDS), "" if len(BOARDS) == 1 else "s"))
