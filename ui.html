@@ -58,8 +58,8 @@ a{color:#7fb4ff;text-decoration:none}
   <span class="pill" id="p-ocd">openocd —</span>
   <span class="pill" id="p-boot">—</span>
   <span style="flex:1"></span>
-  <input id="token" placeholder="token" style="width:130px" title="stored in this browser only"
-         onkeydown="if(event.key==='Enter')saveToken()">
+  <input id="token" type="password" autocomplete="off" placeholder="token" style="width:130px"
+         title="the agent's --token; stored in this browser only" onkeydown="if(event.key==='Enter')saveToken()">
   <button class="small" onclick="saveToken()">Save</button>
 </header>
 <div id="tabs"></div>
@@ -171,6 +171,7 @@ a{color:#7fb4ff;text-decoration:none}
     <div class="row">
       <label class="note" style="width:90px">drive</label>
       <select id="f-path" style="min-width:240px"></select>
+      <input id="f-path-manual" placeholder="or type a path" style="width:180px">
       <span class="note">the board's USB drive — leave empty for a board without one</span>
     </div>
     <div class="row">
@@ -182,6 +183,7 @@ a{color:#7fb4ff;text-decoration:none}
     <div class="row">
       <label class="note" style="width:90px">serial</label>
       <select id="f-port" style="min-width:240px"></select>
+      <input id="f-port-manual" placeholder="or type a port" style="width:180px">
       <label class="note">baud</label><input id="f-baud" value="115200" style="width:90px">
     </div>
     <div class="row">
@@ -208,6 +210,7 @@ a{color:#7fb4ff;text-decoration:none}
 
 <script>
 const $ = id => document.getElementById(id);
+const UI_VERSION = 8;                              // must match AGENT_VERSION in devagent.py
 let BOARDS = [], CUR = null, AUTHED = false, DISCO = {serial:[],drives:[],openocd_cfgs:[]}, TOKENV = localStorage.getItem("devagent_token") || "";
 $("token").value = TOKENV;
 async function saveToken(){                       // a fresh browser starts with no token: everything
@@ -215,6 +218,7 @@ async function saveToken(){                       // a fresh browser starts with
   localStorage.setItem("devagent_token", TOKENV);
   await refresh(); await loadSnippets();
   if(CUR){ loadInfo(); listFiles(); }
+  else if(AUTHED) editBoard(true);               // nothing configured yet - the form is the next step
 }
 function q(extra, withToken){ const p = new URLSearchParams(extra || {}); if(CUR) p.set("board", CUR); if(withToken && TOKENV) p.set("token", TOKENV); return p.toString(); }
 /* The token travels in a header (fetch below adds it); it goes into a URL only where a header is
@@ -231,8 +235,11 @@ function human(n){ const u = ["B","KB","MB","GB"]; let i = 0;
 function url(path, extra){ return path + (path.includes("?") ? "&" : "?") + q(extra); }
 function urlTok(path, extra){ return path + (path.includes("?") ? "&" : "?") + q(extra, true); }
 async function api(method, path, body){
-  const r = await fetch(url(path), {method, body: body === undefined ? (method === "POST" ? "" : undefined) : body});
-  const j = await r.json().catch(()=>({}));
+  let j;
+  try{
+    const r = await fetch(url(path), {method, body: body === undefined ? (method === "POST" ? "" : undefined) : body});
+    j = await r.json().catch(()=>({error: r.ok ? "" : ("HTTP " + r.status)}));
+  }catch(e){ j = {error: "agent unreachable (" + e.message + ")"}; }
   if(j && j.error) TERM.write("\r\n\x1b[31m" + j.error + "\x1b[0m\r\n");
   refresh(); return j;
 }
@@ -286,13 +293,22 @@ const TERM = (() => {
                        while(b.lines.length>MAX){ b.lines.shift(); b.row--; } }
       else if(ch === "\r") b.col = 0;
       else if(ch === "\b") b.col = Math.max(0, b.col-1);
-      else if(ch >= " "){ const L = line();
+      else if(ch >= " "){ let L = line();
+        if(b.col >= 4096){                    // a line that never ends (a print loop without \n)
+          b.row++; b.col = 0; if(b.row >= b.lines.length) b.lines.push({c:[],a:[]}); L = line();
+          while(b.lines.length > MAX){ b.lines.shift(); b.row--; } }
         while(L.c.length < b.col){ L.c.push(" "); L.a.push(""); }
         L.c[b.col] = ch; L.a[b.col] = b.attr; b.col++; }
     }
     if((id || CUR) === CUR) render();
   }
-  function render(){
+  let queued = false;
+  function render(){                          // coalesced: a burst of output paints once per frame
+    if(queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; paint(); });
+  }
+  function paint(){
     const b = B(), out = [];
     for(const L of b.lines){
       let seg = "", cls = null;
@@ -313,12 +329,24 @@ const TERM = (() => {
 const CTRL = {Enter:"\r", Backspace:"\x7f", Tab:"\t", Escape:"\x1b", ArrowUp:"\x1b[A",
               ArrowDown:"\x1b[B", ArrowRight:"\x1b[C", ArrowLeft:"\x1b[D",
               Home:"\x1b[H", End:"\x1b[F", Delete:"\x1b[3~"};
+const CTRL_PUNCT = {"@":0, "[":27, "\\":28, "]":29, "^":30, "_":31, " ":0};
 TERM.el.addEventListener("keydown", e => {
-  if(e.metaKey || (e.ctrlKey && (e.key==="c"||e.key==="v") && window.getSelection().toString())) return;
+  if(e.metaKey) return;                                          // browser shortcuts stay theirs
+  const altgr = e.ctrlKey && e.altKey;                           // AltGr = Ctrl+Alt on Windows/Linux
+  if(e.ctrlKey && !altgr){
+    const k = e.key.toLowerCase();
+    if(k === "v") return;                                        // the paste event takes it
+    if(k === "c" && window.getSelection().toString()) return;    // copy a selection, else Ctrl-C
+    if(e.shiftKey && (k === "c" || k === "v")) return;
+  }
   let out = null;
-  if(e.ctrlKey && e.key.length === 1){ const c = e.key.toLowerCase().charCodeAt(0)-96; if(c>=1&&c<=26) out = String.fromCharCode(c); }
+  if(e.ctrlKey && !altgr && e.key.length === 1){
+    const k = e.key.toLowerCase(), c = k.charCodeAt(0) - 96;
+    if(c >= 1 && c <= 26) out = String.fromCharCode(c);
+    else if(CTRL_PUNCT[e.key] !== undefined) out = String.fromCharCode(CTRL_PUNCT[e.key]);
+  }
   else if(CTRL[e.key] !== undefined) out = CTRL[e.key];
-  else if(e.key.length === 1) out = e.key;
+  else if(e.key.length === 1) out = e.key;                       // plain, Shift, AltGr and Option chars
   if(out !== null){ e.preventDefault(); send(out); }
 });
 TERM.el.addEventListener("paste", e => {
@@ -346,15 +374,28 @@ function pumpAll(){
 }
 function repump(){ for(const k in ABORT) try { ABORT[k].abort(); } catch(e){} }   // roles changed
 async function pumpBoard(id){
+  let lastErr = null, wait = 700;
   while(BOARDS.some(b => b.id === id)){
     const live = (id === CUR);
     const ac = new AbortController(); ABORT[id] = ac;
     try{
-      const t = await (await fetch(burl(id, "/serial/read", {ms: live ? 15000 : 0}),
-                                   {signal: ac.signal})).text();
-      if(t) TERM.write(t, id);
+      const r = await fetch(burl(id, "/serial/read", {ms: live ? 15000 : 0}), {signal: ac.signal});
+      if(r.ok){
+        const t = await r.text();
+        if(t) TERM.write(t, id);
+        if(lastErr){ TERM.write("\x1b[90m(console back)\x1b[0m\r\n", id); lastErr = null; }
+        wait = 700;
+      }else{
+        const j = await r.json().catch(() => ({}));
+        const msg = (j.error || ("HTTP " + r.status)) + (r.status === 401 ? " - enter the token above" : "");
+        if(msg !== lastErr){ TERM.write("\x1b[90m(" + msg + ")\x1b[0m\r\n", id); lastErr = msg; }
+        delete ABORT[id]; await sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+      }
     }catch(e){
-      if(e.name !== "AbortError") await sleep(700);
+      if(e.name !== "AbortError"){
+        if(lastErr !== "unreachable"){ TERM.write("\x1b[90m(agent unreachable - retrying)\x1b[0m\r\n", id); lastErr = "unreachable"; }
+        delete ABORT[id]; await sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+      }
     }
     delete ABORT[id];
     if(!live) await sleep(1500);
@@ -380,15 +421,32 @@ function tabs(){
 }
 async function refresh(){
   try{
-    const h = await (await fetch("/health")).json();
-    if(h.error){ AUTHED = false; $("p-agent").textContent = h.error; return; }
+    const r = await fetch("/health");
+    const h = await r.json().catch(() => ({error: "HTTP " + r.status}));
+    if(h.error){ AUTHED = false; $("p-agent").textContent = h.error + (r.status === 401 ? " — enter it on the right" : "");
+                 $("p-agent").className = "pill off"; return; }
     AUTHED = true;
     BOARDS = h.boards || [];
     if(!CUR && BOARDS.length) CUR = BOARDS[0].id;
-    $("p-agent").textContent = "v" + h.agent + " · up " + h.uptime_s + "s" + (h.auth ? " · token" : "");
+    if(CUR && !BOARDS.some(x => x.id === CUR)) CUR = BOARDS.length ? BOARDS[0].id : null;
+    const flags = [];
+    if(h.pyserial === false) flags.push("pyserial missing on the agent host — no console, no REPL");
+    if(h.cpfs === false && BOARDS.some(x => x.fs_mode === "repl")) flags.push("cpfs.py missing — REPL file access unavailable");
+    if(h.agent !== UI_VERSION) flags.push("panel v" + UI_VERSION + " with agent v" + h.agent);
+    $("p-agent").textContent = "v" + h.agent + " · up " + h.uptime_s + "s" + (h.auth ? " · token" : "")
+                               + (flags.length ? " · " + flags[0] : "");
+    $("p-agent").className = "pill" + (flags.length ? " off" : "");
+    $("p-agent").title = flags.join("\n") || "agent version · uptime";
     tabs();
     pumpAll();
     const b = BOARDS.find(x => x.id === CUR);
+    if(!b){                                                     // nothing configured (or all forgotten)
+      for(const id of ["p-drive","p-serial","p-fs","p-ocd","p-boot"]){ $(id).className = "pill idle" + ($(id).classList.contains("edit") ? " edit" : ""); $(id).textContent = $(id).textContent.split(" ")[0] + " —"; }
+      $("freeinfo").textContent = "";
+      setInfo([["info", "no board configured — ＋ board above adds one"]], true);
+      $("files").textContent = "";
+      return;
+    }
     const pill = (el, cls, txt, title) => { el.textContent = txt; el.className = "pill " + cls
                                             + (el.classList.contains("edit") ? " edit" : "");
                                             el.title = title || txt; };
@@ -425,18 +483,30 @@ async function refresh(){
       if(!b.port && !BUFFERS[b.id]) TERM.write(
         "\x1b[90m(no serial console for this board - add its port with Edit board)\x1b[0m\r\n", b.id);
     }
-  }catch(e){}
+  }catch(e){
+    $("p-agent").textContent = "agent unreachable — is devagent.py still running?";
+    $("p-agent").className = "pill off";
+  }
+}
+function setInfo(rows, dim){                    // [[key, value], ...] into the Board box, as text
+  const box = $("info"); box.textContent = "";
+  for(const [k, v] of rows){
+    const d = document.createElement("div"), a = document.createElement("span"), c = document.createElement("span");
+    a.textContent = k; c.textContent = String(v); if(dim) c.className = "note";
+    d.append(a, c); box.appendChild(d);
+  }
 }
 async function loadSnippets(){
-  const list = await (await fetch("/snippets")).json();
-  const box = $("snips"); box.innerHTML = "";
-  if(!Array.isArray(list)){ box.innerHTML = '<span class="note">' + (list.error || "unavailable") + '</span>'; return; }
+  let list;
+  try{ list = await (await fetch("/snippets")).json(); }catch(e){ list = {error: "agent unreachable"}; }
+  const box = $("snips"); box.textContent = "";
+  if(!Array.isArray(list)){ const n = document.createElement("span"); n.className = "note"; n.textContent = list.error || "unavailable"; box.appendChild(n); return; }
   for(const s of list){
     const btn = document.createElement("button");
     btn.className = "small"; btn.textContent = s.label;
     btn.onclick = async () => {
       TERM.write("\r\n\x1b[36m— " + s.label + " —\x1b[0m\r\n");
-      const j = await api("POST", "/snippet?id=" + s.id);
+      const j = await api("POST", "/snippet?" + new URLSearchParams({id: s.id}));
       if(j.output) TERM.write(j.output.replace(/\n/g, "\r\n") + "\r\n");
       if(j.note) TERM.write("\x1b[33m" + j.note + "\x1b[0m\r\n");
       else if(!j.error && !(j.output || "").trim()) TERM.write("\x1b[33m(no output)\x1b[0m\r\n");
@@ -446,13 +516,13 @@ async function loadSnippets(){
 }
 async function loadInfo(refreshIt){
   if(!CUR) return;
-  $("info").innerHTML = '<div><span>info</span><span class="note">probing…</span></div>';
-  const j = await (await fetch(url("/info", refreshIt ? {refresh:1} : {}))).json();
-  if(j.error){ $("info").innerHTML = '<div><span>info</span><span class="note">' + j.error + '</span></div>'; return; }
+  setInfo([["info", "probing…"]], true);
+  let j;
+  try{ j = await (await fetch(url("/info", refreshIt ? {refresh:1} : {}))).json(); }
+  catch(e){ j = {error: "agent unreachable"}; }
+  if(j.error){ setInfo([["info", j.error]], true); return; }
   const rows = Object.entries(j).filter(([k]) => k !== "raw_tail" && k !== "probed_at");
-  $("info").innerHTML = rows.length
-    ? rows.map(([k,v]) => `<div><span>${k}</span><span>${String(v)}</span></div>`).join("")
-    : '<div><span>info</span><span class="note">nothing returned</span></div>';
+  if(rows.length) setInfo(rows); else setInfo([["info", "nothing returned"]], true);
 }
 async function hardReset(){
   if(!confirm("Hard reset the board?")) return;
@@ -501,10 +571,13 @@ function snapshot(){ window.open(urlTok("/snapshot", {w: $("vidw").value, t: Dat
              // a snapshot joins the running stream now, so it works while the panel is live
 
 /* --- add / edit board --- */
+let FORM_NEW = false;
 function showApp(){ $("app").style.display = "grid"; $("addform").style.display = "none"; }
 async function editBoard(isNew){
-  DISCO = await (await fetch("/discover")).json();
+  try{ DISCO = await (await fetch("/discover")).json(); }
+  catch(e){ DISCO = {error: "agent unreachable"}; }
   if(DISCO.error){ alert(DISCO.error); return; }
+  FORM_NEW = !!isNew;
   DISCO.drives = DISCO.drives || []; DISCO.serial = DISCO.serial || []; DISCO.openocd_cfgs = DISCO.openocd_cfgs || [];
   const b = isNew ? {} : (BOARDS.find(x => x.id === CUR) || {});
   const fill = (sel, items, cur, blank) => {
@@ -535,7 +608,7 @@ async function editBoard(isNew){
   fill($("f-video"), (DISCO.video||[]).map(v => ({value:v, text:v}))
                        .concat([{value:"test", text:"test pattern (no card - checks the plumbing)"}]),
        b.video, true);
-  $("f-video-manual").value = "";
+  $("f-video-manual").value = ""; $("f-path-manual").value = ""; $("f-port-manual").value = "";
   $("f-video-size").value = b.video_size || "";
   $("videonote").textContent = DISCO.video_error                    // never an empty list with no reason
     ? DISCO.video_error
@@ -551,38 +624,55 @@ async function editBoard(isNew){
 }
 async function saveBoard(){
   const spec = {id: $("f-id").value.trim(), label: $("f-label").value.trim(),
-                path: $("f-path").value || null, port: $("f-port").value || null,
+                path: $("f-path-manual").value.trim() || $("f-path").value || null,
+                port: $("f-port-manual").value.trim() || $("f-port").value || null,
                 baud: parseInt($("f-baud").value) || 115200,
                 ocd: $("f-ocd").value || null, fs: $("f-fs").value,
                 video: $("f-video-manual").value.trim() || $("f-video").value || null,
                 video_size: $("f-video-size").value.trim() || null};
-  if(!spec.id){ $("addnote").textContent = "an id is required"; return; }
-  const r = await fetch("/boards", {method:"POST", body: JSON.stringify(spec)});
-  const j = await r.json();
-  if(j.error){ $("addnote").textContent = j.error; return; }
+  const note = t => { $("addnote").textContent = t; };
+  if(!spec.id) return note("an id is required");
+  if(!/^[\w.-]{1,40}$/.test(spec.id)) return note("id: letters, digits, . _ - only (it lives in URLs)");
+  if(FORM_NEW && BOARDS.some(x => x.id === spec.id)) return note("id " + spec.id + " is taken — pick another, or Edit that board");
+  if(!spec.path && !spec.port) return note("a drive or a serial port is needed - pick one, or type it");
+  if(spec.video_size && !/^\d+x\d+$/.test(spec.video_size)) return note("mode looks like 640x480");
+  let j;
+  try{ j = await (await fetch("/boards", {method:"POST", body: JSON.stringify(spec)})).json(); }
+  catch(e){ j = {error: "agent unreachable"}; }
+  if(j.error) return note(j.error);
   CUR = spec.id; showApp(); await refresh(); loadInfo(); listFiles();
 }
 async function removeBoard(){
   if(!CUR || !confirm("Forget board " + CUR + "? (the board itself is untouched)")) return;
-  await fetch("/boards?" + new URLSearchParams({id: CUR}), {method:"DELETE"});
+  await fetch("/boards?" + new URLSearchParams({id: CUR}), {method:"DELETE"}).catch(() => {});
   CUR = null; await refresh(); if(CUR){ loadInfo(); listFiles(); }
 }
 
 /* --- files --- */
 async function listFiles(){
   if(!CUR) return;
-  const rows = await (await fetch(url("/list", {dir:$("path").value.trim(), recursive:$("rec").checked?1:0}))).json();
-  const t = $("files"); t.innerHTML = "";
-  if(!Array.isArray(rows)){ t.innerHTML = `<tr><td class="note">${rows.error}</td></tr>`; return; }
+  let rows;
+  try{ rows = await (await fetch(url("/list", {dir:$("path").value.trim(), recursive:$("rec").checked?1:0}))).json(); }
+  catch(e){ rows = {error: "agent unreachable"}; }
+  const t = $("files"); t.textContent = "";
+  const cell = (tr, cls) => { const td = document.createElement("td"); if(cls) td.className = cls; tr.appendChild(td); return td; };
+  if(!Array.isArray(rows)){ cell(t.insertRow(), "note").textContent = rows.error || "no listing"; return; }
+  const base = $("path").value.trim();
   for(const e of rows){
-    const base = $("path").value.trim();
     const full = (base ? base.replace(/\/$/,"") + "/" : "") + e.name;
-    const tr = document.createElement("tr");
-    tr.innerHTML = e.dir
-      ? `<td>📁 <a href="#" onclick="$('path').value='${full}';listFiles();return false">${e.name}/</a></td>
-         <td class="sz"></td><td class="act"><button class="small" onclick="rmdir('${full}')">rm -r</button></td>`
-      : `<td><a href="${urlTok("/file", {name: full})}" download>${e.name}</a></td>
-         <td class="sz">${e.size}</td><td class="act"><button class="small" onclick="rmFile('${full}')">delete</button></td>`;
+    const tr = document.createElement("tr"), name = cell(tr), a = document.createElement("a");
+    if(e.dir){
+      name.append("📁 "); a.href = "#"; a.textContent = e.name + "/";
+      a.addEventListener("click", ev => { ev.preventDefault(); $("path").value = full; listFiles(); });
+    }else{
+      a.href = urlTok("/file", {name: full}); a.download = e.name; a.textContent = e.name;
+    }
+    name.appendChild(a);
+    cell(tr, "sz").textContent = e.dir ? "" : e.size;
+    const btn = document.createElement("button"); btn.className = "small";
+    btn.textContent = e.dir ? "rm -r" : "delete";
+    btn.addEventListener("click", () => e.dir ? rmdir(full) : rmFile(full));
+    cell(tr, "act").appendChild(btn);
     t.appendChild(tr);
   }
 }
@@ -598,8 +688,9 @@ async function putFile(){
   const f = $("up").files[0]; if(!f) return alert("pick a file first");
   const base = $("path").value.trim(), name = ($("upname").value.trim() || f.name);
   const full = base ? base.replace(/\/$/,"") + "/" + name : name;
-  const r = await fetch(url("/file", {name: full}), {method:"PUT", body: await f.arrayBuffer()});
-  const j = await r.json();
+  let j;
+  try{ j = await (await fetch(url("/file", {name: full}), {method:"PUT", body: await f.arrayBuffer()})).json(); }
+  catch(e){ j = {error: "agent unreachable"}; }
   if(j.error) alert(j.error);                                  // e.g. the bootloader-loop guard
   else if(j.matches_sent === false) alert("WRITE MISMATCH — the bytes on the board differ!");
   listFiles();
@@ -613,8 +704,9 @@ async function enterBootloader(){
 }
 async function upload(path, inputId){
   const f = $(inputId).files[0]; if(!f) return alert("pick a file first");
-  const r = await fetch(url(path), {method:"POST", body: await f.arrayBuffer()});
-  const j = await r.json();
+  let j;
+  try{ j = await (await fetch(url(path), {method:"POST", body: await f.arrayBuffer()})).json(); }
+  catch(e){ j = {error: "agent unreachable"}; }
   alert(j.error ? ("error: " + j.error) : (j.ok ? "OK" + (j.note ? " — " + j.note : "") : JSON.stringify(j).slice(0,300)));
   refresh();
 }
