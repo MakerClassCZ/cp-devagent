@@ -2465,6 +2465,9 @@ def main():
 
     print("devagent v%d on %s:%d  (%d board%s configured)"
           % (AGENT_VERSION, ARGS.bind, ARGS.port, len(BOARDS), "" if len(BOARDS) == 1 else "s"))
+    if is_loopback(ARGS.bind):
+        print("  reachable from THIS machine only - --bind 0.0.0.0 serves the network "
+              "(with --token, or --open)")
     for b in boards_ordered():
         print("  %-10s drive=%-12s serial=%-8s ocd=%-7s ports=%s"
               % (b.id, b.drive() or "-", b.port or "-", b.ocd or "-", b.ocd_ports()["tcl"]))
