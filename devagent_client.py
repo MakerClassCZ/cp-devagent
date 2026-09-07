@@ -6,7 +6,7 @@
     ... rm REMOTE      mkdir DIR      rmdir DIR [--recursive]     free      ports
     ... read [--ms 3000]      tail [--from N] [--ms 3000]      reboot
     ... run FILE [--as code.py] [--ms 20000]         repl "python one-liner" [--ms 6000]
-    ... boards      board port=COM7 [path=M:\\ ...]      forget [ID]     (edit / add / drop)
+    ... boards      board [port=COM7 path=M:\\ ...]      forget [ID]     (show / edit / add / drop)
     ... info [refresh]      snippets      snippet i2c      reset [soft|hard]
     ... snapshot [OUT.jpg] [--width 640]                 (HDMI capture, if the board has one)
     ... ocd start|stop|status      ocd cmd "halt"      flash FIRMWARE.elf   (SWD)
@@ -643,7 +643,11 @@ def _run(ap, a, d):
         fields = dict(kv.split("=", 1) for kv in rest)
         for k, v in fields.items():
             fields[k] = None if v in ("", "none", "null") else v
-        show(d.set_board(**fields))
+        if fields:
+            show(d.set_board(**fields))
+        else:                                            # no fields: show the board, change nothing
+            want = d._board_id()
+            show(next(b for b in d.boards() if b["id"] == want))
     elif c == "forget":
         show(d.forget_board(rest[0] if rest else None))
     elif c == "info":

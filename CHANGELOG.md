@@ -19,10 +19,13 @@ The hardening pass before publishing. Behaviour that changed:
 * **Console/REPL.** Scripted runs (`/run`, `/repl`, `/snippet`) read through their own tap and
   fail loudly when the console is unusable, instead of returning an empty string. A long-poll
   returns on the first byte and notices a client that went away. Pastes go out in slices so the
-  board's echo can be read while it is sent.
+  board's echo can be read while it is sent. A scripted run waits for the REPL prompt after
+  Ctrl-C (and answers "Press any key to enter the REPL" when `code.py` was running) before it
+  enters paste mode — sent blind, the script landed in the plain prompt.
 * **Board registry.** Adds and edits from the panel, the client and `--add` are serialised and
   written atomically; `--add` takes `'ID key=value ...'` (the old `id:drive:port[:ocd]` form is
-  refused with a hint) and validates the id.
+  refused with a hint) and validates the id. An edit that changes nothing leaves the board alone
+  (its console and OpenOCD used to be restarted); the client's bare `board` shows the board.
 * **Linux and macOS.** Drives are found under `/media/<user>`, `/run/media/<user>` and
   `/Volumes`; `/dev/ttyACM*`, `/dev/cu.*`; capture through v4l2/avfoundation; serial ports are
   opened exclusively. `udev/99-circuitpython.rules` for the ModemManager and permission problems.

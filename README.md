@@ -91,7 +91,7 @@ all on the same dispatcher.
 
     devagent_client.py --host H [--port 8100] [--board ID] [--token T] COMMAND ...
 
-    health · version · ports · boards · board KEY=VALUE ... · forget [ID] · info [refresh] · reset [soft|hard]
+    health · version · ports · boards · board [KEY=VALUE ...] · forget [ID] · info [refresh] · reset [soft|hard]
     list [--dir D] [--recursive] · get FILE · put FILE [REMOTE] [--force] · puttree DIR [REMOTE]
     rm FILE · mkdir DIR · rmdir DIR [--recursive] · free
     run FILE [--as code.py] [--ms 8000]      upload + soft reboot + capture the output
@@ -261,7 +261,13 @@ Host and Origin, a body announced before the token — and it prints only what g
   abandoned read used to keep consuming the console for the rest of its window.
 * **`repl` beats `run` for anything that resets the board.** A reset left in `code.py` re-runs
   on every boot; `repl` never touches the drive.
-* **The REPL eats the first character after Ctrl-C**, so the client sends a bare newline first.
+* **A board running `code.py` answers Ctrl-C with "Press any key to enter the REPL"**, and the
+  next byte only enters the REPL — it is not typed. Sent blind, Ctrl-E was that byte, and the
+  script went line by line into the plain prompt (a SyntaxError at the first indented line). A
+  scripted run now waits for the prompt, answers the question with a bare Enter, and waits for
+  the paste-mode prompt before it sends anything.
+* **An edit that changes nothing must change nothing.** Re-posting a board's own spec used to
+  rebuild it — console closed and reopened, OpenOCD stopped — for a no-op.
 * **A UF2 copy "fails" on success.** The board reboots the instant the last block lands, so the
   volume disappears mid-write; a vanished volume after a full write is the normal ending.
 * **One stream, two readers.** The panel polls the console while a script runs over the same
