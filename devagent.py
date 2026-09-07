@@ -250,6 +250,56 @@ def snippets():
     return out
 
 
+class BadRequest(ValueError):
+    """A request the caller got wrong (bad or missing parameter) - answered with 400."""
+
+
+def qstr(q, key, default=None):
+    """?key=value; required when no default is given."""
+    v = (q.get(key) or [None])[0]
+    if v is None or v == "":
+        if default is None:
+            raise BadRequest("?%s is required" % key)
+        return default
+    return v
+
+
+def qint(q, key, default, lo=0, hi=None):
+    """?key= as an int within lo..hi (a bad one used to be a traceback and no reply)."""
+    raw = (q.get(key) or [None])[0]
+    if raw is None or raw == "":
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        raise BadRequest("?%s must be an integer, not %r" % (key, raw))
+    if v < lo or (hi is not None and v > hi):
+        raise BadRequest("?%s must be %d..%s" % (key, lo, "" if hi is None else hi))
+    return v
+
+
+def qfloat(q, key, default, lo=0.0, hi=None):
+    raw = (q.get(key) or [None])[0]
+    if raw is None or raw == "":
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        raise BadRequest("?%s must be a number, not %r" % (key, raw))
+    if v < lo or (hi is not None and v > hi) or v != v:
+        raise BadRequest("?%s must be %g..%s" % (key, lo, "" if hi is None else hi))
+    return v
+
+
+def qflag(q, key, default=False):
+    """?key=1 / ?key=0; an absent key is `default`, a present empty one is False."""
+    v = (q.get(key) or [None])[0]
+    return default if v is None else v not in ("0", "", "false", "no")
+
+
+MS_MAX = 60000                                       # longest wait any ?ms= may ask for
+
+
 class ConsoleError(RuntimeError):
     """The board's REPL cannot be reached: no port, port busy, or the write failed."""
 
@@ -808,6 +858,8 @@ class Board:
                             stack.append(p)
                 return out
         root = self.join(sub)
+        if not os.path.isdir(root):
+            raise FileNotFoundError("no such directory: %s" % sub)
         out = []
         if recursive:
             for dirpath, dirnames, filenames in os.walk(root):
@@ -830,7 +882,10 @@ class Board:
         if self.fs_mode() == "repl":
             with self._repl_fs() as f:
                 return f.read_file("/" + name.lstrip("/"))
-        with open(self.join(name), "rb") as fh:
+        p = self.join(name)
+        if not os.path.isfile(p):
+            raise FileNotFoundError("no such file: %s" % name)
+        with open(p, "rb") as fh:
             return fh.read()
 
     def write(self, name, body):
@@ -866,7 +921,7 @@ class Board:
             return
         p = self.join(name)
         if not os.path.isfile(p):
-            raise FileNotFoundError(name)
+            raise FileNotFoundError("no such file: %s" % name)
         os.remove(p)
 
     def mkdir(self, name):
@@ -883,7 +938,7 @@ class Board:
             return
         p = self.join(name)
         if not os.path.isdir(p):
-            raise FileNotFoundError(name)
+            raise FileNotFoundError("no such directory: %s" % name)
         shutil.rmtree(p) if recursive else os.rmdir(p)
 
     # ---- debug probe (own ports, so boards do not collide) ----
@@ -1596,8 +1651,46 @@ class Server(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     cors_origin = None                            # set by _gate() when a foreign origin is allowed
 
+    replied = False                               # a reply has started: an error can only be logged
+
+    def _dispatch(self, handler):
+        """Every verb goes through here: the gate, then the handler, and whatever it raises
+        becomes a status - 400 for a caller's mistake, 404 for a missing file, 503 when the
+        board's drive or console is not there, 500 for the rest. Handlers used to wrap
+        each branch in its own try/except, and the ones they forgot (PUT to an unplugged
+        board, a bad ?ms=) ended as a traceback with no reply at all."""
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        try:
+            if self._gate(u, q):
+                handler(u, q)
+        except (ConnectionError, socket.timeout):
+            return                                # the client left; nothing to tell it
+        except Exception as e:
+            if self.replied:                      # mid-stream (video): only the log can know
+                print("[%s] %s: %r" % (self.path.split("?")[0], type(e).__name__, e))
+                return
+            if isinstance(e, BadRequest):
+                code, msg = 400, str(e)
+            elif isinstance(e, DriveMissing):
+                code, msg = 503, str(e)
+            elif isinstance(e, ConsoleError):
+                code, msg = 503, str(e)
+            elif isinstance(e, FileNotFoundError):
+                code, msg = 404, str(e) or "not found"
+            elif isinstance(e, PermissionError):
+                code, msg = 403, "permission denied: %s" % (e.filename or e)
+            elif isinstance(e, (FileExistsError, IsADirectoryError, NotADirectoryError)):
+                code, msg = 409, str(e)
+            elif isinstance(e, (ValueError, UnicodeDecodeError, json.JSONDecodeError)):
+                code, msg = 400, str(e) or type(e).__name__
+            else:
+                code, msg = 500, "%s: %s" % (type(e).__name__, e)
+            self._json(code, {"error": msg})
+
     def _start(self, code, ctype, length=None, cache=None):
         """Status + headers for every reply, so the CORS headers never get forgotten."""
+        self.replied = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         if length is not None:
@@ -1716,10 +1809,18 @@ class Handler(BaseHTTPRequestHandler):
         return b
 
     def do_GET(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-        if not self._gate(u, q):
-            return
+        self._dispatch(self._get)
+
+    def do_PUT(self):
+        self._dispatch(self._put)
+
+    def do_DELETE(self):
+        self._dispatch(self._delete)
+
+    def do_POST(self):
+        self._dispatch(self._post)
+
+    def _get(self, u, q):
         if u.path in ("/", "/ui.html"):
             try:
                 with open(os.path.join(HERE, "ui.html"), "rb") as f:
@@ -1752,11 +1853,11 @@ class Handler(BaseHTTPRequestHandler):
         if b is None:
             return
         if u.path == "/serial/read":
-            return self._text(200, b.drain(int(q.get("ms", ["1500"])[0]),      # ms=0: non-blocking
+            return self._text(200, b.drain(qint(q, "ms", 1500, 0, MS_MAX),   # ms=0: non-blocking
                                            stop=self._client_gone))
         if u.path == "/serial/tail":
-            return self._json(200, b.tail(int(q.get("from", ["-1"])[0]),
-                                          int(q.get("ms", ["1500"])[0]), stop=self._client_gone))
+            return self._json(200, b.tail(qint(q, "from", -1, -1), qint(q, "ms", 1500, 0, MS_MAX),
+                                          stop=self._client_gone))
         if u.path == "/ocd/status":
             return self._json(200, {"running": b.ocd_running(), "ports": b.ocd_ports(),
                                     "cfg": b.ocd})
@@ -1767,9 +1868,11 @@ class Handler(BaseHTTPRequestHandler):
             if not have_ffmpeg():
                 return self._json(503, {"error": "ffmpeg not found on the agent host "
                                                  "(install it, or pass --ffmpeg <path>)"})
-            cap = capture_for(dev, int((q.get("w") or ["0"])[0]),
-                              int((q.get("fps") or ["12"])[0]),
-                              (q.get("size") or [b.video_size])[0] or None)
+            size = qstr(q, "size", b.video_size or "")
+            if size and not re.fullmatch(r"\d+x\d+", size):
+                raise BadRequest("?size must look like 640x480")
+            cap = capture_for(dev, qint(q, "w", 0, 0, 7680), qint(q, "fps", 12, 1, 60),
+                              size or None)
             cap.acquire()
             try:
                 if u.path == "/snapshot":
@@ -1799,30 +1902,20 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 cap.release()
         if u.path == "/info":
-            return self._json(200, b.get_info(q.get("refresh", ["0"])[0] not in ("0", "")))
-        if b.drive() is None and b.fs_mode() != "repl":
-            return self._json(503, {"error": b.drive_problem()})
-        try:
-            if u.path == "/free":
-                st = shutil.disk_usage(b.drive())
-                return self._json(200, {"free": st.free, "total": st.total, "used": st.used})
-            if u.path == "/list":
-                return self._json(200, b.list(q.get("dir", [""])[0],
-                                              q.get("recursive", ["0"])[0] not in ("0", "")))
-            if u.path == "/file":
-                data = b.read(q["name"][0])
-                self._start(200, "application/octet-stream", len(data))
-                self.wfile.write(data)
-                return
-        except Exception as e:
-            return self._json(404, {"error": repr(e)})
+            return self._json(200, b.get_info(qflag(q, "refresh")))
+        if u.path == "/free":
+            st = shutil.disk_usage(b.join(""))    # join() says 503 when the drive is gone
+            return self._json(200, {"free": st.free, "total": st.total, "used": st.used})
+        if u.path == "/list":
+            return self._json(200, b.list(qstr(q, "dir", ""), qflag(q, "recursive")))
+        if u.path == "/file":
+            data = b.read(qstr(q, "name"))
+            self._start(200, "application/octet-stream", len(data))
+            self.wfile.write(data)
+            return
         return self._json(404, {"error": "unknown path"})
 
-    def do_PUT(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-        if not self._gate(u, q):
-            return
+    def _put(self, u, q):
         if u.path != "/file":
             return self._json(404, {"error": "unknown path"})
         b = self._board(q)
@@ -1831,43 +1924,31 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body(need=True)
         if body is None:
             return
-        try:
-            name = q["name"][0]
-            if q.get("force", ["0"])[0] in ("0", ""):
-                why = autorun_guard(name, body)
-                if why:
-                    return self._json(409, {"error": why})
-            return self._json(200, b.write(name, body))
-        except Exception as e:
-            return self._json(500, {"error": repr(e)})
+        name = qstr(q, "name")
+        if not qflag(q, "force"):
+            why = autorun_guard(name, body)
+            if why:
+                return self._json(409, {"error": why})
+        return self._json(200, b.write(name, body))
 
-    def do_DELETE(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-        if not self._gate(u, q):
-            return
+    def _delete(self, u, q):
         if u.path == "/boards":
             bid = (q.get("id") or [None])[0]
             return self._json(200, {"removed": bool(bid and drop_board(bid))})
         b = self._board(q)
         if b is None:
             return
-        try:
-            if u.path == "/file":
-                b.delete(q["name"][0])
-                return self._json(200, {"deleted": q["name"][0]})
-            if u.path == "/dir":
-                b.rmdir(q["name"][0], q.get("recursive", ["0"])[0] not in ("0", ""))
-                return self._json(200, {"removed": q["name"][0]})
-        except Exception as e:
-            return self._json(500, {"error": repr(e)})
+        if u.path == "/file":
+            name = qstr(q, "name")
+            b.delete(name)
+            return self._json(200, {"deleted": name})
+        if u.path == "/dir":
+            name = qstr(q, "name")
+            b.rmdir(name, qflag(q, "recursive"))
+            return self._json(200, {"removed": name})
         return self._json(404, {"error": "unknown path"})
 
-    def do_POST(self):
-        u = urlparse(self.path)
-        q = parse_qs(u.query)
-        if not self._gate(u, q):
-            return
+    def _post(self, u, q):
         body = self._body(need=u.path in BODY_REQUIRED)
         if body is None:
             return
@@ -1875,39 +1956,35 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=lambda: (time.sleep(0.2), os._exit(0)), daemon=True).start()
             return self._json(200, {"shutdown": True})
         if u.path == "/boards":
-            try:
-                spec = json.loads(body.decode() or "{}")
-                return self._json(200, add_board(spec).status())
-            except Exception as e:
-                return self._json(400, {"error": repr(e)})
+            spec = json.loads(body.decode("utf-8") or "{}")
+            if not isinstance(spec, dict):
+                raise BadRequest("the body must be a JSON object")
+            return self._json(200, add_board(spec).status())
         b = self._board(q)
         if b is None:
             return
         if u.path == "/serial/write":
             return self._json(200, {"sent": b.send(body)})
         if u.path == "/reset":
-            return self._json(200, b.reset(q.get("mode", ["soft"])[0]))
+            mode = qstr(q, "mode", "soft")
+            if mode not in ("soft", "hard"):
+                raise BadRequest("?mode must be soft or hard")
+            return self._json(200, b.reset(mode))
         if u.path == "/repl":
-            try:
-                out = b.run_repl(body.decode("utf-8", "replace"),
-                                 int(q.get("ms", ["6000"])[0]))
-            except ConsoleError as e:
-                return self._json(503, {"error": str(e)})
+            out = b.run_repl(body.decode("utf-8", "replace"), qint(q, "ms", 6000, 0, MS_MAX))
             return self._json(200, {"output": out})
         if u.path == "/snippet":
-            sid = (q.get("id") or [None])[0]
+            sid = qstr(q, "id")
             snip = snippets().get(sid)
             if snip is None:
                 return self._json(404, {"error": "no snippet %r" % sid})
-            try:
-                out = b.run_repl(snip["code"], int(q.get("ms", ["6000"])[0]))
-            except ConsoleError as e:
-                return self._json(503, {"error": str(e)})
+            ms = qint(q, "ms", 6000, 0, MS_MAX)
+            out = b.run_repl(snip["code"], ms)
             note = None
             if not out.strip():
                 note = ("the board sent nothing back in %d ms - is %s really this board's REPL, "
                         "and is the board past its boot (a program in code.py that never yields "
-                        "still answers Ctrl-C)?" % (int(q.get("ms", ["6000"])[0]), b.port))
+                        "still answers Ctrl-C)?" % (ms, b.port))
             return self._json(200, {"id": sid, "label": snip["label"], "output": out, "note": note})
         if u.path == "/serial/reboot":
             b.drain(200)
@@ -1916,49 +1993,42 @@ class Handler(BaseHTTPRequestHandler):
             b.send(b"\x04")
             return self._json(200, {"rebooted": True})
         if u.path == "/bootloader/enter":
-            return self._json(200, b.bootloader_enter(
-                q.get("method", ["repl"])[0], float(q.get("timeout", ["20"])[0])))
+            return self._json(200, b.bootloader_enter(bl_method(q), qfloat(q, "timeout", 20, 0, 300)))
         if u.path == "/uf2":
             if body[:4] != b"UF2\n":
                 return self._json(400, {"error": "body is not a UF2 image (bad magic)"})
             vol = uf2_volume()
-            if vol is None and q.get("enter", ["1"])[0] not in ("0", ""):
-                r = b.bootloader_enter(q.get("method", ["repl"])[0],
-                                       float(q.get("timeout", ["20"])[0]))
+            if vol is None and qflag(q, "enter", True):
+                r = b.bootloader_enter(bl_method(q), qfloat(q, "timeout", 20, 0, 300))
                 vol = r.get("volume")
                 if vol is None:
                     return self._json(503, {"error": "could not enter the bootloader", "detail": r})
             if vol is None:
                 return self._json(503, {"error": "no UF2 volume; enter the bootloader first"})
             res = uf2_write(body, vol)
-            if res.get("ok") and q.get("wait", ["1"])[0] not in ("0", ""):
-                res["drive_back"] = wait_for(b.drive, float(q.get("wait_s", ["25"])[0]))
+            if res.get("ok") and qflag(q, "wait", True):
+                res["drive_back"] = wait_for(b.drive, qfloat(q, "wait_s", 25, 0, 300))
             return self._json(200, res)
         if u.path == "/ocd/start":
-            return self._json(200, b.ocd_start(q.get("cfg", [None])[0]))
+            return self._json(200, b.ocd_start(qstr(q, "cfg", "") or None))
         if u.path == "/ocd/stop":
             return self._json(200, b.ocd_stop())
         if u.path == "/ocd/cmd":
             if not b.ocd_running():
                 return self._json(503, {"error": "openocd is not running for this board"})
-            try:
-                return self._json(200, {"output": b.ocd_tcl(body.decode("utf-8", "replace"))})
-            except Exception as e:
-                return self._json(500, {"error": repr(e)})
+            return self._json(200, {"output": b.ocd_tcl(body.decode("utf-8", "replace"))})
         if u.path == "/ocd/flash":
             if not body:
                 return self._json(400, {"error": "body must be the firmware image"})
-            return self._json(200, b.ocd_flash(body, q.get("verify", ["1"])[0] not in ("0", ""),
-                                               q.get("reset", ["1"])[0] not in ("0", "")))
+            return self._json(200, b.ocd_flash(body, qflag(q, "verify", True),
+                                               qflag(q, "reset", True)))
         if u.path == "/mkdir":
-            try:
-                b.mkdir(q["name"][0])
-                return self._json(200, {"created": q["name"][0]})
-            except Exception as e:
-                return self._json(500, {"error": repr(e)})
+            name = qstr(q, "name")
+            b.mkdir(name)
+            return self._json(200, {"created": name})
         if u.path == "/run":
-            name = q.get("name", ["code.py"])[0]
-            if q.get("force", ["0"])[0] in ("0", ""):
+            name = qstr(q, "name", "code.py")
+            if not qflag(q, "force"):
                 why = autorun_guard(name, body)
                 if why:
                     return self._json(409, {"error": why})
@@ -1968,7 +2038,7 @@ class Handler(BaseHTTPRequestHandler):
                 b.send(b"\x03")
                 time.sleep(0.3)
                 b.send(b"\x04")
-                res["output"] = b.collect(sink, int(q.get("ms", ["8000"])[0]), done=code_done)
+                res["output"] = b.collect(sink, qint(q, "ms", 8000, 0, MS_MAX), done=code_done)
             return self._json(200, res)
         return self._json(404, {"error": "unknown path"})
 
@@ -1988,6 +2058,13 @@ def parse_add(spec):
             raise ValueError("expected key=value with a key from %s, got %r" % (keys, w))
         d[key] = val
     return d
+
+
+def bl_method(q):
+    m = qstr(q, "method", "repl")
+    if m not in ("repl", "touch", "auto"):
+        raise BadRequest("?method must be repl, touch or auto")
+    return m
 
 
 def probe_existing(port):
