@@ -1,5 +1,8 @@
 # devagent — your CircuitPython boards over HTTP
 
+<img width="2560" height="1313" alt="image" src="https://github.com/user-attachments/assets/a64ec220-4f6c-49e4-babf-fa136a46c2ad" />
+
+
 One Python file on the machine the boards are plugged into. It serves each board's **drive**,
 **serial console**, **debug probe** and — through a capture card — its **screen** over plain
 HTTP, so `curl` works, any language can drive it, and a script, a CI job or an AI agent can put
