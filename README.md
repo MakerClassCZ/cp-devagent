@@ -237,6 +237,12 @@ The suite starts the agent in a temp directory, so your `devagent.json` is untou
 capture tests run when `ffmpeg` is installed. `tests/test_panel.mjs` drives the panel in a
 headless browser (Playwright) against a running agent — see its header.
 
+    python tests/authprobe.py 192.168.1.50:8100      # your deployment, from another machine
+
+is the black-box check of the gate on an agent that has a token: ~2000 requests — every
+endpoint with every method, a wrong token in every place it could go, path tricks, a foreign
+Host and Origin, a body announced before the token — and it prints only what got through.
+
 ## Things it knows that cost time to learn
 
 * **Nothing is cached.** A reset re-enumerates USB and invalidates handles; the drive is
