@@ -94,7 +94,7 @@ all on the same dispatcher.
     health · version · ports · boards · board [KEY=VALUE ...] · forget [ID] · info [refresh] · reset [soft|hard]
     list [--dir D] [--recursive] · get FILE · put FILE [REMOTE] [--force] · puttree DIR [REMOTE]
     rm FILE · mkdir DIR · rmdir DIR [--recursive] · free
-    run FILE [--as code.py] [--ms 8000]      upload + soft reboot + capture the output
+    run FILE [--as code.py] [--ms 8000]      upload + soft reboot + capture until the program ends
     repl "CODE" [--ms 6000]                  paste into the REPL, nothing written to the board
     read [--ms N] · tail [--from N] · write TEXT · reboot
     snippets · snippet ID · snapshot [FILE] [--width W]
@@ -141,7 +141,7 @@ Replies are JSON unless noted; `ms` values are milliseconds, capped at 60000.
 | `GET /serial/tail?from=&ms=` | console output by cursor, **consumes nothing**: `{next, text, gap}`; `from=-1` starts at the current end |
 | `POST /serial/write` · `POST /serial/reboot` | raw bytes to the board · Ctrl-D |
 | `POST /repl?ms=` | body is code, pasted into the REPL; `{output}` |
-| `POST /run?name=&ms=` | upload + soft reboot + capture; `{output, matches_sent, ...}` |
+| `POST /run?name=&ms=` | to the REPL prompt, upload, Ctrl-D, capture until the program ends or prints `~~END~~` (`ms` at most); `{output, stopped, matches_sent, ...}` — `stopped` is `~~END~~`, `Code done running.` or `timeout` |
 | `GET /info[?refresh=1]` | board identity, probed once over the REPL and cached |
 | `GET /snippets` · `POST /snippet?id=&ms=` | canned REPL scripts and their output |
 | `POST /reset?mode=soft\|hard` | soft reboot, or a real reset (SWD when a probe is up) |
@@ -230,7 +230,7 @@ rather than on the open internet.
 ## Tests
 
     pip install pyserial
-    python tests/test_agent.py                      # ~20 s: the agent end to end on a fake board
+    python tests/test_agent.py                      # ~30 s: the agent end to end on a fake board
 
 Needs no hardware: `tests/fakeboard.py` is a pty that answers like the REPL plus a temp drive.
 The suite starts the agent in a temp directory, so your `devagent.json` is untouched. The
@@ -242,6 +242,23 @@ headless browser (Playwright) against a running agent — see its header.
 is the black-box check of the gate on an agent that has a token: ~2000 requests — every
 endpoint with every method, a wrong token in every place it could go, path tricks, a foreign
 Host and Origin, a body announced before the token — and it prints only what got through.
+
+## Adafruit LLM-Recipes hardware tests
+
+[adafruit/LLM-Recipes](https://github.com/adafruit/LLM-Recipes) runs CircuitPython hardware
+tests from pytest: a script per test that prints `PASS: …` / `FAIL: …` lines and `~~END~~` when it
+is done, a `circuitpython_runner.py` that copies it to CIRCUITPY, soft-reboots and reads the
+serial port, and `test_hw_circuitpython.py` that parses the output. devagent speaks the same
+conventions — `run` stops at `~~END~~`, and the output reaches you line for line — and
+`tools/circuitpython_runner.py` is that runner with the board behind an agent:
+
+    cp tools/circuitpython_runner.py <driver-repo>/circuitpython_runner.py
+    DEVAGENT_URL=http://192.168.1.50:8100 DEVAGENT_TOKEN=SECRET DEVAGENT_BOARD=jam \
+        pytest test_hw_circuitpython.py -v
+
+Same command line (`--port`/`--path` are accepted and ignored), same stdout, so the pytest
+file and the skills are used unchanged; the difference is that the drive and the serial port
+live where the agent runs. One `run` waits at most 300 s (`--duration 300`).
 
 ## Things it knows that cost time to learn
 
@@ -261,6 +278,10 @@ Host and Origin, a body announced before the token — and it prints only what g
   abandoned read used to keep consuming the console for the rest of its window.
 * **`repl` beats `run` for anything that resets the board.** A reset left in `code.py` re-runs
   on every boot; `repl` never touches the drive.
+* **`run` goes to the REPL prompt *before* it writes the file.** Written into a running board,
+  `code.py` starts by auto-reload before the agent sends Ctrl-D — and interrupting the program
+  that was running prints "Code done running." too, which ended the capture before the new
+  program had said a word. At the prompt auto-reload is off; the capture starts at the Ctrl-D.
 * **A board running `code.py` answers Ctrl-C with "Press any key to enter the REPL"**, and the
   next byte only enters the REPL — it is not typed. Sent blind, Ctrl-E was that byte, and the
   script went line by line into the plain prompt (a SyntaxError at the first indented line). A

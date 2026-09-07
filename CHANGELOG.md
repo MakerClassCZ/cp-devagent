@@ -21,7 +21,13 @@ The hardening pass before publishing. Behaviour that changed:
   returns on the first byte and notices a client that went away. Pastes go out in slices so the
   board's echo can be read while it is sent. A scripted run waits for the REPL prompt after
   Ctrl-C (and answers "Press any key to enter the REPL" when `code.py` was running) before it
-  enters paste mode — sent blind, the script landed in the plain prompt.
+  enters paste mode — sent blind, the script landed in the plain prompt. `/run` does the same
+  before it writes the file (written into a running board, `code.py` started by auto-reload,
+  and the interrupted program's "Code done running." ended the capture at once); it reports
+  why the capture stopped (`stopped`) and, like `/repl`, stops at a printed `~~END~~` line —
+  the Adafruit LLM-Recipes sentinel. A scripted run may wait up to 300 s.
+* **LLM-Recipes.** `tools/circuitpython_runner.py` is a drop-in for the hw-tests-runner skill's
+  `circuitpython_runner.py`: same command line and stdout, the board behind an agent.
 * **Board registry.** Adds and edits from the panel, the client and `--add` are serialised and
   written atomically; `--add` takes `'ID key=value ...'` (the old `id:drive:port[:ocd]` form is
   refused with a hint) and validates the id. An edit that changes nothing leaves the board alone

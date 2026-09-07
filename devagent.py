@@ -40,7 +40,8 @@ Endpoints (all take ?board=<id>; with one board configured it is optional)
     GET    /serial/read?ms=             console output      POST /serial/write · /serial/reboot
     GET    /serial/tail?from=&ms=       console output by CURSOR (nothing is consumed - a script
                                         and the panel can both read the whole stream)
-    POST   /run?name=&ms=               upload + reboot + capture
+    POST   /run?name=&ms=               upload + reboot + capture, until the program ends
+                                        (or prints ~~END~~ - the LLM-Recipes runner sentinel)
     GET    /info[?refresh=1]            board identity, probed once and cached
     GET    /snippets                    POST /snippet?id=      canned REPL scripts
     POST   /repl?ms=                    body is code; pasted into the REPL, nothing written
@@ -114,6 +115,25 @@ def repl_done(text):
 def code_done(text):
     """True once CircuitPython says the program in code.py finished."""
     return "Code done running." in text
+
+
+END_MARK = "~~END~~"    # Adafruit LLM-Recipes convention: a script prints it as its last line
+_END_LINE = re.compile(r"(?:^|[\r\n])[ \t]*~~END~~[ \t]*[\r\n]")
+
+
+def end_marked(text):
+    """True once the board printed ~~END~~ on a line of its own (a complete one, as the
+    LLM-Recipes runner takes it) - the script says it is finished, whatever it does next."""
+    return _END_LINE.search(text) is not None
+
+
+def run_stopped(text):
+    """Why a captured run is over: the sentinel, CircuitPython's own last word, or neither."""
+    if end_marked(text):
+        return END_MARK
+    if code_done(text):
+        return "Code done running."
+    return "timeout"
 
 
 PRESS_ANY_KEY = "Press any key to enter the REPL"    # what a finished/interrupted code.py shows
@@ -308,7 +328,8 @@ def qflag(q, key, default=False):
     return default if v is None else v not in ("0", "", "false", "no")
 
 
-MS_MAX = 60000                                       # longest wait any ?ms= may ask for
+MS_MAX = 60000                                       # longest wait a console poll may ask for
+RUN_MS_MAX = 300000                                  # a scripted run: a sensor test can take minutes
 
 
 class OcdError(RuntimeError):
@@ -792,6 +813,21 @@ class Board:
                 return self.ser_error or "cannot open %s" % self.port
         return None
 
+    def to_prompt(self, sink):
+        """Ctrl-C, then wait until the board sits at its REPL prompt.
+
+        A board running code.py answers Ctrl-C with a traceback and "Press any key to enter
+        the REPL" - and the next byte, whatever it is, only enters the REPL. Sent blind after
+        a fixed pause, Ctrl-E was that byte: no paste mode, and the script went line by line
+        into the plain prompt (a SyntaxError at the first indented line, seen on a Fruit Jam
+        mid-game). So wait for the prompt, answer the any-key question with a bare Enter if
+        that is what came, and wait for the prompt again."""
+        self.send_or_raise(b"\x03")
+        if (self.wait_console(sink, 3000, lambda t: at_prompt(t) or PRESS_ANY_KEY in t)
+                and not at_prompt("".join(sink))):
+            self.send_or_raise(b"\r")
+            self.wait_console(sink, 3000, at_prompt)
+
     def run_repl(self, code, ms=6000):
         """Paste-mode a snippet into the REPL and return what it printed. Paste mode is
         what keeps indentation intact - sending a block line by line runs half of it.
@@ -801,24 +837,14 @@ class Board:
             raise ConsoleError(err)
         with self.repl_lock:                              # two scripts at once would interleave
             with self.tap(exclusive=True) as sink:
-                self.send_or_raise(b"\x03")
-                # A board running code.py answers Ctrl-C with a traceback and "Press any key to
-                # enter the REPL" - and the next byte, whatever it is, only enters the REPL. Sent
-                # blind after a fixed pause, Ctrl-E was that byte: no paste mode, and the script
-                # went line by line into the plain prompt (a SyntaxError at the first indented
-                # line, seen on a Fruit Jam mid-game). So wait for the prompt, answer the any-key
-                # question with a bare Enter if that is what came, and wait for the prompt again.
-                if (self.wait_console(sink, 3000, lambda t: at_prompt(t) or PRESS_ANY_KEY in t)
-                        and not at_prompt("".join(sink))):
-                    self.send_or_raise(b"\r")
-                    self.wait_console(sink, 3000, at_prompt)
+                self.to_prompt(sink)
                 self.send_or_raise(b"\x05")               # Ctrl-E: paste mode
                 self.wait_console(sink, 1000, lambda t: t.rstrip().endswith("==="))
                 marked = 'print("%s")\n%s' % (REPL_MARK, code)
                 self.send_or_raise(marked.replace("\r\n", "\n").replace("\n", "\r").encode())
                 time.sleep(0.1)
                 self.send_or_raise(b"\x04")               # Ctrl-D: run it
-                out = self.collect(sink, ms, done=repl_done)
+                out = self.collect(sink, ms, done=lambda t: repl_done(t) or end_marked(t))
         # Paste mode echoes every line back, so the raw capture is the script itself followed by
         # its output. The marker is printed AFTER the echo, so the last one splits the two.
         if REPL_MARK in out:
@@ -2286,14 +2312,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise BadRequest("?mode must be soft or hard")
             return self._result(b.reset(mode))
         if u.path == "/repl":
-            out = b.run_repl(body.decode("utf-8", "replace"), qint(q, "ms", 6000, 0, MS_MAX))
+            out = b.run_repl(body.decode("utf-8", "replace"), qint(q, "ms", 6000, 0, RUN_MS_MAX))
             return self._json(200, {"output": out})
         if u.path == "/snippet":
             sid = qstr(q, "id")
             snip = snippets().get(sid)
             if snip is None:
                 return self._json(404, {"error": "no snippet %r" % sid})
-            ms = qint(q, "ms", 6000, 0, MS_MAX)
+            ms = qint(q, "ms", 6000, 0, RUN_MS_MAX)
             out = b.run_repl(snip["code"], ms)
             note = None
             if not out.strip():
@@ -2350,13 +2376,25 @@ class Handler(BaseHTTPRequestHandler):
                 why = autorun_guard(name, body)
                 if why:
                     return self._json(409, {"error": why})
-            with b.tap() as sink:                     # a private copy: the panel's console poll
-                res = b.write(name, body)             # would otherwise take the output first
-                time.sleep(0.4)
-                b.send(b"\x03")
-                time.sleep(0.3)
+            # The same order as Adafruit's circuitpython_runner: to the REPL prompt FIRST, then
+            # the file, then Ctrl-D. Writing code.py into a running board starts it (auto-reload)
+            # before we do, and interrupting a running program prints "Code done running." -
+            # which used to end the capture before the new program had said a word. At the
+            # prompt auto-reload is off and a stale "Code done" cannot be in what we read.
+            ms = qint(q, "ms", 8000, 0, RUN_MS_MAX)   # a bad one is refused before anything moves
+            err = b.console_error()                   # no console: no reboot and no capture
+            if err:
+                raise ConsoleError(err)
+            with b.repl_lock, b.tap() as sink:        # a private copy: the panel's console poll
+                b.to_prompt(sink)                     # would otherwise take the output first
+                res = b.write(name, body)
+                time.sleep(0.4)                       # let the drive settle before the reload
+                started = sum(len(chunk) for chunk in sink)
                 b.send(b"\x04")
-                res["output"] = b.collect(sink, qint(q, "ms", 8000, 0, MS_MAX), done=code_done)
+                out = b.collect(sink, ms,
+                                done=lambda t: end_marked(t[started:]) or code_done(t[started:]))
+                res["output"] = out[started:]
+                res["stopped"] = run_stopped(res["output"])
             return self._json(200, res)
         return self._json(404, {"error": "unknown path"})
 

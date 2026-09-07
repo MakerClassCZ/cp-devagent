@@ -209,12 +209,59 @@ class Console(unittest.TestCase):
         self.assertIn("early", out); self.assertNotIn("never", out); self.assertLess(took, 2.5)
         time.sleep(3.2)                                     # let the fake finish its script
 
-    def test_run_sees_the_reboot(self):
-        status, j = req("POST", "/run?board=fake&name=code.py&ms=8000", b"print(1)", timeout=20)
-        self.assertEqual(status, 200)
+    def run_code(self, code, ms=8000):
+        t0 = time.time()
+        status, j = req("POST", "/run?board=fake&name=code.py&ms=%d" % ms, code.encode(), timeout=60)
+        self.assertEqual(status, 200, j)
         self.assertTrue(j["matches_sent"])
-        self.assertIn("soft reboot", j["output"]); self.assertIn("code.py line 2", j["output"])
         req("DELETE", "/file?board=fake&name=code.py")
+        return j, time.time() - t0
+
+    def test_run_sees_the_reboot(self):
+        j, _ = self.run_code("OUT hello from code.py\nSLEEP 0.3\nOUT bye")
+        self.assertIn("soft reboot", j["output"]); self.assertIn("code.py output:", j["output"])
+        self.assertIn("hello from code.py", j["output"]); self.assertIn("bye", j["output"])
+        self.assertEqual(j["stopped"], "Code done running.")
+
+    def test_run_while_code_runs(self):
+        """Interrupting the program that was running prints "Code done running." too - that
+        must not end the capture before the uploaded one has started (the old order wrote,
+        then Ctrl-C'd, and returned with the OLD program's traceback as the output)."""
+        req("POST", "/serial/write?board=fake", b"\x04")     # reboot: code.py runs for ~2 s
+        time.sleep(0.3)
+        j, took = self.run_code("OUT fresh start\nSLEEP 0.2\nOUT fresh end")
+        self.assertIn("fresh start", j["output"]); self.assertIn("fresh end", j["output"])
+        self.assertNotIn("KeyboardInterrupt", j["output"])   # the old program's end is not ours
+        self.assertEqual(j["stopped"], "Code done running.")
+        self.assertLess(took, 6)
+
+    def test_run_stops_at_end_mark(self):
+        """LLM-Recipes convention: a script that printed ~~END~~ is done, whatever follows."""
+        j, took = self.run_code("OUT PASS: sensor found\nOUT ~~END~~\nSLEEP 4\nOUT late", ms=20000)
+        self.assertIn("PASS: sensor found", j["output"]); self.assertIn("~~END~~", j["output"])
+        self.assertNotIn("late", j["output"])
+        self.assertEqual(j["stopped"], "~~END~~")
+        self.assertLess(took, 3)
+        req("POST", "/serial/write?board=fake", b"\x03")    # end the fake's SLEEP
+        time.sleep(0.3)
+
+    def test_run_reports_the_timeout(self):
+        j, took = self.run_code("OUT slow\nSLEEP 3\nOUT done", ms=1000)
+        self.assertIn("slow", j["output"]); self.assertNotIn("done", j["output"])
+        self.assertEqual(j["stopped"], "timeout")
+        req("POST", "/serial/write?board=fake", b"\x03")
+        time.sleep(0.3)
+
+    def test_repl_stops_at_end_mark(self):
+        out, took = self.repl("OUT ~~END~~\nSLEEP 2\nOUT never")
+        self.assertIn("~~END~~", out); self.assertNotIn("never", out)
+        self.assertLess(took, 1.5)
+        time.sleep(2.3)                                     # let the fake finish its script
+
+    def test_repl_end_mark_echo_does_not_count(self):
+        """The paste-mode echo of print("~~END~~") is not the sentinel: only a printed line is."""
+        out, took = self.repl('print("~~END~~")\nOUT first\nSLEEP 0.5\nOUT second')
+        self.assertIn("first", out); self.assertIn("second", out)
 
     def test_repl_while_code_runs(self):
         """Ctrl-C into a running code.py lands on "Press any key to enter the REPL"; the script
@@ -380,6 +427,50 @@ class Client(unittest.TestCase):
         self.assertEqual(r.returncode, 1); self.assertIn("404", r.stderr)
         r = subprocess.run(cli + ["--port", str(free_port()), "health"], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 2); self.assertIn("unreachable", r.stderr)
+
+
+class RecipesRunner(unittest.TestCase):
+    """tools/circuitpython_runner.py stands in for the LLM-Recipes runner: pytest's
+    test_hw_circuitpython.py must find the PASS:/FAIL: lines and the ~~END~~ sentinel in its
+    stdout, and nothing of the boot chatter before "code.py output:"."""
+    def runner(self, script, duration=20, **env):
+        local = os.path.join(WORK, "hw_test.py")
+        with open(local, "w") as f:
+            f.write(script)
+        cmd = [sys.executable, os.path.join(REPO, "tools", "circuitpython_runner.py"), local,
+               "--port", "/dev/ttyACM0", "--path", "/media/x/CIRCUITPY/", "--duration", str(duration)]
+        full = dict(os.environ, DEVAGENT_URL="http://127.0.0.1:%d" % PORT, DEVAGENT_TOKEN=TOKEN)
+        full.update(env)
+        t0 = time.time()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 40, env=full)
+        req("DELETE", "/file?board=fake&name=code.py")
+        return r, time.time() - t0
+
+    def test_pass_lines_and_sentinel_come_through(self):
+        r, took = self.runner("OUT PASS: sensor found\nOUT Upper 10.0 -> 11.25: OK\nOUT ~~END~~\n"
+                              "SLEEP 4\nOUT late")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = [l.strip() for l in r.stdout.splitlines()]
+        self.assertIn("PASS: sensor found", lines); self.assertIn("Upper 10.0 -> 11.25: OK", lines)
+        self.assertIn("~~END~~", lines); self.assertNotIn("late", r.stdout)
+        self.assertNotIn("soft reboot", r.stdout); self.assertNotIn("code.py output:", r.stdout)
+        self.assertLess(took, 4)
+        req("POST", "/serial/write?board=fake", b"\x03")    # end the fake's SLEEP
+        time.sleep(0.3)
+
+    def test_a_hang_is_reported_not_hidden(self):
+        r, _ = self.runner("OUT FAIL: never ends\nSLEEP 5\nOUT late", duration=1)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("FAIL: never ends", r.stdout); self.assertNotIn("~~END~~", r.stdout)
+        self.assertIn("no ~~END~~", r.stderr)
+        req("POST", "/serial/write?board=fake", b"\x03")
+        time.sleep(0.3)
+
+    def test_agent_errors_exit_nonzero(self):
+        r, _ = self.runner("OUT x", DEVAGENT_TOKEN="wrong")
+        self.assertNotEqual(r.returncode, 0); self.assertIn("HTTP 401", r.stderr)
+        r, _ = self.runner("OUT x", DEVAGENT_URL="http://127.0.0.1:%d" % free_port())
+        self.assertNotEqual(r.returncode, 0); self.assertIn("unreachable", r.stderr)
 
 
 if __name__ == "__main__":

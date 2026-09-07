@@ -11,10 +11,12 @@ The fake REPL (what the pty answers to):
   Ctrl-E            paste mode: "=== " prompt, everything echoed until Ctrl-D, then the pasted
                     text is "run": a line  print("--devagent--")  prints the marker,
                     "SLEEP x" pauses x seconds, "OUT text" prints text - anything else is ignored
-  Ctrl-D            soft reboot: "soft reboot", "code.py line 1/2" a second apart, then the prompt
+  Ctrl-D            soft reboot: "soft reboot", "code.py output:", then code.py from the drive
+                    (OUT/SLEEP lines, as in paste mode; a file without any = "code.py line 1/2"
+                    a second apart), then "Code done running." and the any-key question
   anything else     echoed
-So a script sent by /repl is the sequence of OUT and SLEEP lines that describes the output the
-board should produce, and its timing."""
+So a script sent by /repl, or written as code.py by /run, is the sequence of OUT and SLEEP lines
+that describes the output the board should produce, and its timing."""
 import json, os, pty, threading, time, tempfile
 
 UID = "DEADBEEF01"
@@ -38,26 +40,41 @@ class FakeBoard:
     def say(self, text):
         os.write(self.master, text.encode())
 
-    def _run_script(self, text):
+    def _play(self, text, interruptible=False):
+        """Run a script in the fake's language. False if Ctrl-C ended it early (code.py only)."""
         for line in text.splitlines():
             line = line.strip()
             if line.startswith('print("--devagent--")'):
                 self.say("--devagent--\r\n")
             elif line.startswith("SLEEP "):
-                time.sleep(float(line[6:]))
+                until = time.time() + float(line[6:])
+                while time.time() < until:
+                    time.sleep(0.05)
+                    if interruptible and not self.running:
+                        return False
             elif line.startswith("OUT "):
                 self.say(line[4:] + "\r\n")
+        return True
+
+    def _run_script(self, text):
+        self._play(text)
         self.say(">>> ")
 
     def _reboot(self):
         self.running = True
         self.say("soft reboot\r\n")
-        for n in (1, 2):
-            for _ in range(10):                             # 1 s, interruptible by Ctrl-C
-                time.sleep(0.1)
-                if not self.running:
-                    return
-            self.say("code.py line %d\r\n" % n)
+        self.say("Auto-reload is on. Simply save files over USB to run them or enter REPL to "
+                 "disable.\r\ncode.py output:\r\n")
+        code = "SLEEP 1\nOUT code.py line 1\nSLEEP 1\nOUT code.py line 2"
+        try:
+            with open(os.path.join(self.drive, "code.py")) as f:
+                written = f.read()
+            if any(l.strip().startswith(("OUT ", "SLEEP ")) for l in written.splitlines()):
+                code = written                              # what /run wrote is what runs
+        except OSError:
+            pass
+        if not self._play(code, interruptible=True):
+            return                                          # Ctrl-C printed the traceback
         self.running = False
         self._code_done()
 
