@@ -959,6 +959,8 @@ class Board:
         p = self.join(name)
         if not os.path.isdir(p):
             raise FileNotFoundError("no such directory: %s" % name)
+        if not recursive and os.listdir(p):
+            raise FileExistsError("%s is not empty (recursive=1 removes it with its contents)" % name)
         shutil.rmtree(p) if recursive else os.rmdir(p)
         sync_drive()
 
@@ -2348,6 +2350,9 @@ def parse_add(spec):
         if not eq or key not in keys:
             raise ValueError("expected key=value with a key from %s, got %r" % (keys, w))
         d[key] = val
+    if not re.fullmatch(r"[\w.-]{1,40}", d.get("id", "")):
+        raise ValueError("%r is not a board id (letters, digits, . _ -); the form is "
+                         "'ID path=... port=...'" % d.get("id", ""))
     return d
 
 
