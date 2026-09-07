@@ -303,6 +303,10 @@ def qflag(q, key, default=False):
 MS_MAX = 60000                                       # longest wait any ?ms= may ask for
 
 
+class OcdError(RuntimeError):
+    """OpenOCD is not there to talk to (not started, died, port refused) - answered with 503."""
+
+
 class ConsoleError(RuntimeError):
     """The board's REPL cannot be reached: no port, port busy, or the write failed."""
 
@@ -393,6 +397,7 @@ class Board:
                                                      # lock so a check-then-wait cannot miss a wake-up
         self.repl_lock = threading.RLock()
         self.ser = None
+        self.ser_error = None                  # why the last open failed (serial_open_error)
         self.ser_lock = threading.RLock()
         self.ocd_proc = None
         self.info = None                             # cached board identity (see get_info)
@@ -410,6 +415,7 @@ class Board:
     def status(self):
         self.relink()
         return dict(self.to_json(), drive=self.drive(), serial_open=self.serial_ok(),
+                    serial_error=self.ser_error,
                     drive_problem=None if self.drive() else self.drive_problem(),
                     port_present=self.port_present, reader_alive=self.reader_alive(),
                     openocd=self.ocd_running(), ocd_ports=self.ocd_ports(),
@@ -441,7 +447,7 @@ class Board:
         if not self.path:
             return "no drive configured"
         if not os.path.isdir(self.path):
-            return "drive not found: %s" % self.path
+            return unmounted_label("CIRCUITPY") or "drive not found: %s" % self.path
         why = drive_check(self.path)
         if why:
             return why
@@ -497,7 +503,7 @@ class Board:
             if self.port and serial is not None and (self.ser is None or self.uid is None):
                 ports = {p.device: p for p in comports()}
             if self.uid is None:                                   # first contact: learn who this is
-                here = ports.get(self.port) if ports else None
+                here = port_lookup(ports, self.port) if ports else None
                 learnt = drive_uid or (here.serial_number if here else None)
                 if learnt:
                     self.uid, changed = learnt.upper(), True
@@ -513,19 +519,20 @@ class Board:
                             self.path = cand
                             break
                 if ports is not None:
-                    here = ports.get(self.port)
+                    here = port_lookup(ports, self.port)
                     here_uid = (here.serial_number or "").upper() if here else None
                     if here_uid != self.uid:                       # gone, or the name went elsewhere
-                        taken = {b.port for b in others}
+                        taken = {os.path.realpath(b.port) for b in others if b.port}
                         for dev, p in ports.items():
-                            if dev != self.port and dev not in taken \
+                            if dev != self.port and os.path.realpath(dev) not in taken \
                                     and (p.serial_number or "").upper() == self.uid:
+                                dev = stable_port_name(dev)
                                 moved.append("serial %s -> %s" % (self.port, dev))
                                 self.close_serial()
                                 self.port = dev
                                 break
             if ports is not None:                                  # present = there AND ours
-                here = ports.get(self.port)
+                here = port_lookup(ports, self.port)
                 here_uid = (here.serial_number or "").upper() if here else None
                 self.port_present = here is not None and (not self.uid or not here_uid
                                                           or here_uid == self.uid)
@@ -560,10 +567,15 @@ class Board:
             return self.ser
         try:
             # short timeout on purpose: the read holds the port lock, so a long one makes every
-            # keystroke wait for it - that is felt directly as typing lag in the web console
-            self.ser = serial.Serial(self.port, self.baud, timeout=0.02, write_timeout=2)
-        except Exception:
+            # keystroke wait for it - that is felt directly as typing lag in the web console.
+            # exclusive: an flock on POSIX, so a second agent (or Thonny next to this one)
+            # gets a clear refusal instead of both silently stealing bytes from the board
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.02, write_timeout=2,
+                                     exclusive=True)
+            self.ser_error = None
+        except Exception as e:
             self.ser = None
+            self.ser_error = serial_open_error(self.port, e)
         return self.ser
 
     def close_serial(self):
@@ -585,8 +597,9 @@ class Board:
         while not self.dead:
             try:
                 self._read_once()
-            except Exception as e:                   # a dead reader would look like a silent
-                self.note("console reader: %r" % e)  # board; log it and carry on
+            except Exception as e:                   # broad on purpose: unplugging raises
+                self.note("console reader: %r" % e)  # OSError 5, SerialException or
+                time.sleep(0.5)                      # termios.error - log it and carry on
                 time.sleep(0.5)
 
     def _read_once(self):
@@ -737,8 +750,9 @@ class Board:
                 return False
             try:
                 s.write(data)
-                s.flush()
-                return True
+                if os.name == "nt":       # POSIX flush() is tcdrain(): it waits for the board to
+                    s.flush()             # take the bytes - forever when it is halted under
+                return True               # OpenOCD, with every console request behind the lock
             except Exception:
                 self.ser = None
                 return False
@@ -763,7 +777,7 @@ class Board:
             return "no serial console configured for board %r" % self.id
         with self.ser_lock:
             if self.open_serial() is None:
-                return "cannot open %s (in use by another program?)" % self.port
+                return self.ser_error or "cannot open %s" % self.port
         return None
 
     def run_repl(self, code, ms=6000):
@@ -914,6 +928,7 @@ class Board:
             os.fsync(f.fileno())
         with open(p, "rb") as f:
             ondisk = f.read()
+        sync_drive()
         return {"size": len(ondisk), "sha256": hashlib.sha256(ondisk).hexdigest(),
                 "matches_sent": ondisk == body}
 
@@ -926,6 +941,7 @@ class Board:
         if not os.path.isfile(p):
             raise FileNotFoundError("no such file: %s" % name)
         os.remove(p)
+        sync_drive()
 
     def mkdir(self, name):
         if self.fs_mode() == "repl":
@@ -933,6 +949,7 @@ class Board:
                 f.makedirs("/" + name.strip("/"))
             return
         os.makedirs(self.join(name), exist_ok=True)
+        sync_drive()
 
     def rmdir(self, name, recursive):
         if self.fs_mode() == "repl":
@@ -943,6 +960,7 @@ class Board:
         if not os.path.isdir(p):
             raise FileNotFoundError("no such directory: %s" % name)
         shutil.rmtree(p) if recursive else os.rmdir(p)
+        sync_drive()
 
     # ---- debug probe (own ports, so boards do not collide) ----
     def ocd_ports(self):
@@ -968,15 +986,41 @@ class Board:
                "-c", "gdb_port %d" % p["gdb"], "-c", "telnet_port %d" % p["telnet"],
                "-c", "tcl_port %d" % p["tcl"]]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL)
         except Exception as e:
-            return {"error": repr(e)}
+            return {"error": "cannot start %s: %s" % (ARGS.openocd, e)}
+        # its output is kept (last lines) instead of thrown away: "Can't find target/rp2350.cfg"
+        # and "unable to open CMSIS-DAP device" are the two real reasons it dies on Linux
+        self.ocd_tail = collections.deque(maxlen=40)
+        threading.Thread(target=self._ocd_drain, args=(proc, self.ocd_tail), daemon=True).start()
         time.sleep(1.2)
         if proc.poll() is not None:
-            return {"error": "openocd exited immediately (rc=%s) - probe attached? target powered?"
-                    % proc.returncode}
+            return {"error": "openocd exited immediately (rc=%s): %s"
+                    % (proc.returncode, self.ocd_hint(self.ocd_log())), "log": self.ocd_log()}
         self.ocd_proc = proc
         return {"running": True, "pid": proc.pid, "cfg": name, "ports": p}
+
+    @staticmethod
+    def _ocd_drain(proc, tail):
+        for line in iter(proc.stdout.readline, b""):
+            tail.append(line.decode("utf-8", "replace").rstrip())
+
+    def ocd_log(self):
+        return "\n".join(getattr(self, "ocd_tail", ()))
+
+    @staticmethod
+    def ocd_hint(log):
+        low = log.lower()
+        if "can't find" in low and ".cfg" in low:
+            return ("this OpenOCD lacks the config file (see the log) - for RP2040/RP2350 use "
+                    "the Raspberry Pi build: https://github.com/raspberrypi/openocd")
+        if "unable to open" in low or "libusb_open" in low or "permission" in low:
+            return ("cannot open the debug probe - on Linux add the udev rules "
+                    "(udev/99-circuitpython.rules here, or OpenOCD's contrib/60-openocd.rules)")
+        if "address already in use" in low:
+            return "its ports are held by another OpenOCD (an orphan from before?)"
+        return log.strip().splitlines()[-1] if log.strip() else "probe attached? target powered?"
 
     def ocd_stop(self):
         p, self.ocd_proc = self.ocd_proc, None
@@ -990,7 +1034,12 @@ class Board:
         return {"stopped": True}
 
     def ocd_tcl(self, cmd, timeout=120):
-        s = socket.create_connection(("127.0.0.1", self.ocd_ports()["tcl"]), timeout=timeout)
+        try:
+            s = socket.create_connection(("127.0.0.1", self.ocd_ports()["tcl"]), timeout=timeout)
+        except OSError as e:
+            raise OcdError("openocd is not answering on its tcl port %d: %s%s"
+                           % (self.ocd_ports()["tcl"], e,
+                              ("\n" + self.ocd_log()) if self.ocd_log() else ""))
         s.settimeout(timeout)
         try:
             s.sendall(cmd.encode() + b"\x1a")
@@ -1038,8 +1087,8 @@ class Board:
         with os.fdopen(fd, "wb") as f:
             f.write(body)
         try:
-            verb = "program %s%s%s" % (path.replace("\\", "/"), " verify" if verify else "",
-                                       " reset" if reset else "")
+            verb = "program {%s}%s%s" % (path.replace("\\", "/"), " verify" if verify else "",
+                                         " reset" if reset else "")   # {}: a path with a space
             if self.ocd_running():
                 out = self.ocd_telnet(["halt", verb])
             else:
@@ -1050,12 +1099,16 @@ class Board:
                     return {"error": "openocd not found on PATH (%s)" % ARGS.openocd}
                 iface, target, speed = spec
                 r = subprocess.run([ARGS.openocd, "-f", iface, "-f", target, "-c", speed,
-                                    "-c", "%s exit" % verb], capture_output=True, timeout=600)
+                                    "-c", "%s exit" % verb], capture_output=True, timeout=600,
+                                   stdin=subprocess.DEVNULL)
                 out = (r.stdout + r.stderr).decode("utf-8", "replace")
-            return {"ok": ("Verified OK" in out) or ("** Programming Finished **" in out),
-                    "bytes": len(body), "output": out[-4000:]}
-        except Exception as e:
-            return {"error": repr(e)}
+            ok = ("Verified OK" in out) or ("** Programming Finished **" in out)
+            return {"ok": ok, "bytes": len(body), "output": out[-4000:],
+                    "error": None if ok else self.ocd_hint(out)}
+        except subprocess.TimeoutExpired:
+            return {"error": "openocd did not finish within 10 minutes"}
+        except OSError as e:
+            return {"error": "cannot run %s: %s" % (ARGS.openocd, e)}
         finally:
             try:
                 os.unlink(path)
@@ -1067,6 +1120,7 @@ class Board:
         vol = uf2_volume()
         if vol:
             return {"already": True, "volume": vol, "info": uf2_info(vol)}
+        sync_drive()
         if method in ("repl", "auto"):
             self.send(b"\x03")
             time.sleep(0.3)
@@ -1091,7 +1145,8 @@ class Board:
         vol = wait_for(uf2_volume, timeout)
         return {"volume": vol, "info": uf2_info(vol) if vol else [],
                 "touch_error": touch_error,
-                "error": None if vol else "no UF2 volume appeared within %.0fs" % timeout}
+                "error": None if vol else (unmounted_label("RPI-RP2", "RP2350", "FTHR840BOOT")
+                                           or "no UF2 volume appeared within %.0fs" % timeout)}
 
 
 class ReplFs:
@@ -1132,10 +1187,24 @@ def host_volumes():
         import string
         return [r for r in ("%s:\\" % c for c in string.ascii_uppercase) if os.path.isdir(r)]
     vols = []
-    for base in ("/media", "/run/media", "/Volumes", os.path.expanduser("~/media")):
+    if sys.platform == "darwin":                     # one level only: /Volumes/X, never into it
+        try:
+            vols = [os.path.join("/Volumes", n) for n in sorted(os.listdir("/Volumes"))]
+        except OSError:
+            pass
+        return [v for v in vols if os.path.isdir(v)]
+    # Linux: every mounted FAT volume, wherever udisks, a manual mount or an fstab line put it -
+    # a fixed list of directories missed a headless box, where nothing mounts under /media
+    for mnt in mounted_fat():
+        vols.append(mnt)
+    for base in ("/media", "/run/media", os.path.expanduser("~/media")):
         if not os.path.isdir(base):
             continue
-        for name in sorted(os.listdir(base)):
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
             p = os.path.join(base, name)
             if not os.path.isdir(p):
                 continue
@@ -1145,7 +1214,44 @@ def host_volumes():
                             if os.path.isdir(os.path.join(p, sub)))
             except OSError:
                 pass
-    return vols
+    seen, out = set(), []
+    for v in vols:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+FAT_TYPES = ("vfat", "exfat", "msdos", "fat", "fuseblk")   # fuseblk: exfat through FUSE
+
+
+def mounted_fat(mounts_file="/proc/mounts"):
+    """Mount points of FAT volumes from /proc/mounts (a board is always one). Octal escapes
+    (\\040 for a space) are what the kernel writes for odd characters in a path."""
+    out = []
+    try:
+        with open(mounts_file, "r", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] in FAT_TYPES:
+            out.append(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[1]))
+    return out
+
+
+def unmounted_label(*labels):
+    """A plugged-in volume that nobody mounted (a headless Linux box has no udisks): the
+    /dev/disk/by-label/ node exists, the mount does not. The hint to give, or None."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    for label in labels:
+        node = "/dev/disk/by-label/" + label
+        if os.path.exists(node):
+            return ("%s is plugged in but not mounted - mount it first, e.g. "
+                    "udisksctl mount -b %s" % (label, node))
+    return None
 
 
 def drive_identity(root):
@@ -1170,8 +1276,78 @@ def drive_identity(root):
     return ident
 
 
+def sync_drive():
+    """Push the page cache to the card. A manual `mount` of a FAT volume (no `flush` option)
+    keeps a delete or mkdir in memory; a reset right after it left the old file - or a
+    dirty FAT - on the board. os.sync() is host-wide but cheap when nothing else is dirty."""
+    if hasattr(os, "sync"):
+        try:
+            os.sync()
+        except OSError:
+            pass
+
+
 def circuitpy_drives():
     return [v for v in host_volumes() if os.path.isfile(os.path.join(v, "boot_out.txt"))]
+
+
+def serial_open_error(port, exc):
+    """A reason a person can act on. Every failure used to read 'in use by another program?',
+    which on Linux is usually wrong: it is EACCES (not in the dialout group) or ENOENT."""
+    text = str(exc)
+    err = getattr(exc, "errno", None)
+    if not isinstance(err, int):
+        m = re.search(r"\[Errno (\d+)\]", text)
+        err = int(m.group(1)) if m else None
+    low = text.lower()
+    if os.name != "nt":
+        if err == errno.EACCES:
+            return ("permission denied on %s - add yourself to the group that owns it "
+                    "(usually: sudo usermod -aG dialout $USER, then log in again)" % port)
+        if err == errno.ENOENT:
+            return "%s does not exist (unplugged, or a different name now)" % port
+        if err in (errno.EBUSY, errno.EAGAIN) or "exclusively lock" in low:
+            return "%s is held by another program (Thonny, mu, screen, another devagent?)" % port
+    else:
+        if "winerror 5" in low or "access is denied" in low or "permissionerror" in low:
+            return "%s is held by another program (Thonny, mu, PuTTY, another devagent?)" % port
+        if "winerror 2" in low or "cannot find the file" in low or "filenotfounderror" in low:
+            return "%s does not exist (unplugged, or a different COM number now)" % port
+    return "cannot open %s: %s" % (port, text.strip() or type(exc).__name__)
+
+
+def port_lookup(ports, name):
+    """The comports() entry for a configured port name: by name, by what a symlink such as
+    /dev/serial/by-id/... resolves to, or the macOS tty./cu. twin of the same device."""
+    if not name:
+        return None
+    p = ports.get(name)
+    if p is not None:
+        return p
+    try:
+        real = os.path.realpath(name)
+    except OSError:
+        return None
+    for dev, p in ports.items():
+        if dev != name and os.path.realpath(dev) == real:
+            return p
+    if sys.platform == "darwin":
+        twin = name.replace("/dev/tty.", "/dev/cu.", 1) if name.startswith("/dev/tty.") \
+            else name.replace("/dev/cu.", "/dev/tty.", 1)
+        return ports.get(twin)
+    return None
+
+
+def stable_port_name(dev):
+    """A name for `dev` that survives re-enumeration: its /dev/serial/by-id/ link on Linux
+    (ttyACM0 becomes ttyACM1 after a re-plug next to another board), else `dev` itself."""
+    try:
+        for link in sorted(glob.glob("/dev/serial/by-id/*")):
+            if os.path.realpath(link) == os.path.realpath(dev):
+                return link
+    except OSError:
+        pass
+    return dev
 
 
 def comports():
@@ -1373,7 +1549,7 @@ def have_ffmpeg():
     if _FFMPEG_OK is None:
         try:
             subprocess.run([ARGS.ffmpeg, "-version"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=5)
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=5)
             _FFMPEG_OK = True
         except Exception:
             _FFMPEG_OK = False
@@ -1430,10 +1606,10 @@ def video_probe():
         return {"devices": [], "ffmpeg": False,
                 "error": "ffmpeg not found (looked for %r) - install it, or start the agent with "
                          "--ffmpeg <full path>" % ARGS.ffmpeg}
+    if sys.platform == "darwin":
+        return video_probe_avfoundation()
     if os.name != "nt":
-        devs = sorted(glob.glob("/dev/video*"))
-        return {"devices": devs, "ffmpeg": True,
-                "error": None if devs else "no /dev/video* devices on this host"}
+        return video_probe_v4l2()
     try:
         r = subprocess.run([ARGS.ffmpeg, "-hide_banner", "-list_devices", "true",
                             "-f", "dshow", "-i", "dummy"],
@@ -1445,6 +1621,49 @@ def video_probe():
     devs = parse_dshow(text)
     return {"devices": devs, "ffmpeg": True,
             "error": None if devs else "ffmpeg listed no DirectShow video device",
+            "raw": text[-1200:] if not devs else None}
+
+
+def video_probe_v4l2():
+    """Linux capture nodes. /dev/v4l/by-id/*-video-index0 first: one entry per card, by a name
+    that survives a re-plug, and never the card's second (metadata) node that only fails with
+    'Inappropriate ioctl'. Bare /dev/videoN in numeric order otherwise (video10 < video2)."""
+    devs = sorted(glob.glob("/dev/v4l/by-id/*-video-index0"))
+    if not devs:
+        devs = sorted(glob.glob("/dev/video*"),
+                      key=lambda p: int(re.sub(r"\D", "", p) or 0))
+    if not devs:
+        return {"devices": [], "ffmpeg": True, "error": "no /dev/video* devices on this host"}
+    denied = [d for d in devs if not os.access(d, os.R_OK | os.W_OK)]
+    return {"devices": devs, "ffmpeg": True,
+            "error": ("no permission on %s - add yourself to the 'video' group "
+                      "(sudo usermod -aG video $USER, then log in again)" % denied[0])
+            if len(denied) == len(devs) else None}
+
+
+def video_probe_avfoundation():
+    """macOS: ffmpeg lists AVFoundation devices as '[N] Name' lines; the device value is the
+    index, used as '-i N:none'. (Untested on real hardware - reports welcome.)"""
+    try:
+        r = subprocess.run([ARGS.ffmpeg, "-hide_banner", "-f", "avfoundation",
+                            "-list_devices", "true", "-i", ""],
+                           capture_output=True, timeout=20, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return {"devices": [], "ffmpeg": True, "error": "ffmpeg failed: %r" % (e,)}
+    text = (r.stderr or b"").decode("utf-8", "replace")
+    devs, in_video = [], False
+    for line in text.splitlines():
+        if "AVFoundation video devices" in line:
+            in_video = True
+            continue
+        if "AVFoundation audio devices" in line:
+            in_video = False
+            continue
+        m = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line) if in_video else None
+        if m:
+            devs.append({"name": m.group(2), "value": m.group(1)})
+    return {"devices": devs, "ffmpeg": True,
+            "error": None if devs else "ffmpeg listed no AVFoundation video device",
             "raw": text[-1200:] if not devs else None}
 
 
@@ -1464,13 +1683,16 @@ def video_input(dev, size=None):
     if os.name == "nt":
         return ["-f", "dshow", "-rtbufsize", "64M"] + \
                (["-video_size", size] if size else []) + ["-i", "video=%s" % dev]
+    if sys.platform == "darwin":
+        return ["-f", "avfoundation", "-framerate", "30"] + \
+               (["-video_size", size] if size else []) + ["-i", "%s:none" % dev]
     return ["-f", "v4l2"] + (["-video_size", size] if size else []) + ["-i", dev]
 
 
 def video_proc(dev, width=0, fps=0, frames=0, size=None):
     """An ffmpeg writing MJPEG to stdout: one frame for a snapshot, a stream otherwise.
     width=0 means native - no scaling at all, which is what you want for pixel art."""
-    cmd = [ARGS.ffmpeg, "-hide_banner", "-loglevel", "error"] + video_input(dev, size)
+    cmd = [ARGS.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error"] + video_input(dev, size)
     if frames:
         cmd += ["-frames:v", str(frames)]
     vf = []
@@ -1481,7 +1703,10 @@ def video_proc(dev, width=0, fps=0, frames=0, size=None):
     if fps:
         cmd += ["-r", str(fps)]
     cmd += ["-f", "mjpeg", "-q:v", "5", "-"]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # never the agent's stdin: ffmpeg puts a tty into raw mode and a kill leaves it so,
+    # which is why the shell needed a `reset` after every snapshot
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL)
 
 
 class Capture:
@@ -1722,7 +1947,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self._gate(u, q):
                 handler(u, q)
-        except (ConnectionError, socket.timeout):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
             return                                # the client left; nothing to tell it
         except Exception as e:
             if self.replied:                      # mid-stream (video): only the log can know
@@ -1732,7 +1957,7 @@ class Handler(BaseHTTPRequestHandler):
                 code, msg = 400, str(e)
             elif isinstance(e, DriveMissing):
                 code, msg = 503, str(e)
-            elif isinstance(e, ConsoleError):
+            elif isinstance(e, (ConsoleError, OcdError)):
                 code, msg = 503, str(e)
             elif isinstance(e, FileNotFoundError):
                 code, msg = 404, str(e) or "not found"
@@ -2060,9 +2285,11 @@ class Handler(BaseHTTPRequestHandler):
                 r = b.bootloader_enter(bl_method(q), qfloat(q, "timeout", 20, 0, 300))
                 vol = r.get("volume")
                 if vol is None:
-                    return self._json(503, {"error": "could not enter the bootloader", "detail": r})
+                    return self._json(503, {"error": "could not enter the bootloader: %s"
+                                            % r.get("error"), "detail": r})
             if vol is None:
-                return self._json(503, {"error": "no UF2 volume; enter the bootloader first"})
+                return self._json(503, {"error": unmounted_label("RPI-RP2", "RP2350")
+                                        or "no UF2 volume; enter the bootloader first"})
             res = uf2_write(body, vol)
             if res.get("ok") and qflag(q, "wait", True):
                 res["drive_back"] = wait_for(b.drive, qfloat(q, "wait_s", 25, 0, 300))
@@ -2073,7 +2300,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, b.ocd_stop())
         if u.path == "/ocd/cmd":
             if not b.ocd_running():
-                return self._json(503, {"error": "openocd is not running for this board"})
+                return self._json(503, {"error": "openocd is not running for this board",
+                                        "log": b.ocd_log() or None})
             return self._json(200, {"output": b.ocd_tcl(body.decode("utf-8", "replace"))})
         if u.path == "/ocd/flash":
             if not body:
@@ -2210,6 +2438,8 @@ def main():
             print("       Use a different --port, or --replace to take it over.")
             return 1
 
+    ARGS.openocd = os.path.expanduser(ARGS.openocd)
+    ARGS.ffmpeg = os.path.expanduser(ARGS.ffmpeg)
     load_config()
     if not is_loopback(ARGS.bind) and not TOKEN and not ARGS.open:
         print("ERROR: --bind %s serves the network, and there is no token: anyone who can reach "

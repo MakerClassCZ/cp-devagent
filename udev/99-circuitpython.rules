@@ -1,0 +1,20 @@
+# devagent - udev rules for CircuitPython boards and debug probes on Linux.
+#
+#   sudo cp udev/99-circuitpython.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# 1. Keep ModemManager off the REPL: it probes every new ttyACM with AT commands for a few
+#    seconds after plug-in, during which the port is busy and the board sees "AT" typed at it.
+# 2. Make the console port usable without root: the dialout group (add yourself with
+#    `sudo usermod -aG dialout $USER`, then log in again).
+# Vendor ids: 239a Adafruit, 2e8a Raspberry Pi. A board from another vendor: add its
+# idVendor from `lsusb`.
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="239a", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="2e8a", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="239a", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", GROUP="dialout", MODE="0660"
+
+# Debug probes for OpenOCD without root: Raspberry Pi Debug Probe (2e8a:000c) and the
+# older Picoprobe firmware (2e8a:0004), both CMSIS-DAP.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000c", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0004", MODE="0660", GROUP="plugdev", TAG+="uaccess"
