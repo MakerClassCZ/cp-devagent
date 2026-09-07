@@ -1,0 +1,625 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>devagent</title>
+<style>
+:root{--bg:#0f1117;--panel:#171a24;--line:#262b39;--fg:#dfe3ee;--dim:#8c94a8;--accent:#e8601f;--ok:#57c97a;--bad:#e2564a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+header b{color:var(--accent);letter-spacing:.5px}
+.pill{font:12px ui-monospace,monospace;background:#212636;border:1px solid var(--line);border-radius:999px;padding:2px 10px;color:var(--dim);
+      max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill.idle{color:var(--dim)}
+.pill.on{color:var(--ok);border-color:#2c4a35}.pill.off{color:var(--bad);border-color:#4a2c2c}
+.pill.edit{cursor:pointer}.pill.edit:hover{border-color:var(--accent)}
+#tabs{display:flex;gap:6px;padding:8px 14px 0;flex-wrap:wrap;background:var(--panel)}
+.tab{padding:6px 14px;border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;
+     background:#141824;color:var(--dim);cursor:pointer;font-size:13px}
+.tab.sel{background:var(--bg);color:var(--fg);border-color:#39415a}
+.tab.add{color:var(--accent)}
+main{display:grid;grid-template-columns:minmax(0,1fr) var(--side,400px);gap:14px;padding:14px;align-items:start}
+.side{display:flex;flex-direction:column;gap:14px;min-width:0;position:relative}
+.grip{position:absolute;left:-13px;top:0;bottom:0;width:13px;border-radius:7px;cursor:col-resize}
+.grip:hover,.grip.on{background:#39415a}
+@media(max-width:980px){main{grid-template-columns:1fr}.grip{display:none}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+h3{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
+button{font:13px system-ui;padding:6px 12px;border-radius:6px;border:1px solid #39415a;background:#232a3d;color:var(--fg);cursor:pointer}
+button:hover{border-color:#5a6a9a}
+button.warn{border-color:#6a3a2a;color:#ffb59a}
+button.small{padding:4px 9px;font-size:12px}
+input,select{font:13px ui-monospace,monospace;padding:6px 8px;border-radius:6px;border:1px solid #39415a;background:#11141d;color:var(--fg)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
+#term{height:50vh;overflow:auto;background:#0a0c12;border:1px solid var(--line);border-radius:8px;padding:10px;
+      font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;outline:none;cursor:text}
+#term:focus{border-color:#3f6ea8}
+.f31,.f91{color:#ff6b5e}.f32,.f92{color:#57c97a}.f33,.f93{color:#e8c46b}
+.f34,.f94{color:#7fb4ff}.f35,.f95{color:#d08bff}.f36,.f96{color:#5fd6d6}.f37,.f97{color:#dfe3ee}
+.f90{color:#8c94a8}.bold{font-weight:700}
+table{width:100%;border-collapse:collapse;font:12px ui-monospace,monospace}
+td{padding:3px 4px;border-bottom:1px solid #1e2230}
+td.sz{text-align:right;color:var(--dim);white-space:nowrap}
+td.act{text-align:right;white-space:nowrap}
+a{color:#7fb4ff;text-decoration:none}
+.note{color:var(--dim);font-size:12px}
+.kv{font:12px ui-monospace,monospace}
+.kv div{display:flex;gap:8px;border-bottom:1px solid #1e2230;padding:2px 0}
+.kv span:first-child{color:var(--dim);min-width:92px}
+#addform{display:none}
+</style>
+
+<header>
+  <b>devagent</b>
+  <span class="pill" id="p-agent">…</span>
+  <span class="pill edit" id="p-drive" onclick="editBoard()">drive —</span>
+  <span class="pill edit" id="p-serial" onclick="editBoard()">serial —</span>
+  <span class="pill" id="p-fs">fs —</span>
+  <span class="pill" id="p-ocd">openocd —</span>
+  <span class="pill" id="p-boot">—</span>
+  <span style="flex:1"></span>
+  <input id="token" placeholder="token" style="width:130px" title="stored in this browser only"
+         onkeydown="if(event.key==='Enter')saveToken()">
+  <button class="small" onclick="saveToken()">Save</button>
+</header>
+<div id="tabs"></div>
+
+<main id="app">
+  <section>
+    <h2>Console <span class="note" id="termstate"></span></h2>
+    <div id="term" tabindex="0"></div>
+    <div class="row">
+      <button onclick="send('\x03')">Ctrl-C</button>
+      <button onclick="send('\x04')">Ctrl-D</button>
+      <button onclick="send('\x05')" title="paste mode">Ctrl-E</button>
+      <button onclick="send('\t')">Tab</button>
+      <button onclick="api('POST','/reset?mode=soft')">Soft reboot</button>
+      <button class="warn" onclick="hardReset()">Hard reset</button>
+      <button onclick="TERM.clear()">Clear</button>
+      <label class="note"><input type="checkbox" id="follow" checked style="vertical-align:-2px"> follow</label>
+      <span style="flex:1"></span>
+      <span class="note">click the console, then type — arrows, Tab and Ctrl-keys all go through</span>
+    </div>
+  </section>
+
+  <div class="side" id="side">
+    <div class="grip" id="grip" title="drag to resize · double-click to fit the picture"></div>
+  <section id="videobox" style="display:none">
+    <h2>Screen <span class="note" id="vidnote"></span></h2>
+    <div id="vidwrap" style="overflow:auto;max-height:70vh">
+      <img id="vid" alt="" title="click for a full-size snapshot" onclick="snapshot()"
+           style="display:none;width:100%;border-radius:6px;background:#000;image-rendering:pixelated;cursor:zoom-in">
+    </div>
+    <div class="row">
+      <button id="vidbtn" onclick="toggleVideo()">Start</button>
+      <button onclick="snapshot()">Snapshot</button>
+      <label class="note" title="show the captured pixels 1:1 instead of fitting the column">
+        <input type="checkbox" id="vid11" onchange="fit()" style="vertical-align:-2px"> 1:1</label>
+      <label class="note">scale
+        <select id="vidw" onchange="restartVideo()">
+          <option value="0" selected>native</option>
+          <option value="320">320</option><option value="640">640</option><option value="960">960</option>
+        </select></label>
+      <label class="note">fps
+        <select id="vidfps" onchange="restartVideo()">
+          <option>5</option><option selected>12</option><option>20</option>
+        </select></label>
+      <span class="note">the capture card is opened only while this is running</span>
+    </div>
+  </section>
+  <section>
+    <h2>Board</h2>
+    <div class="kv" id="info"><div><span>info</span><span class="note">loading…</span></div></div>
+    <div class="row">
+      <button class="small" onclick="loadInfo(true)">Re-probe</button>
+      <button class="small" onclick="editBoard()">Edit board</button>
+      <button class="small warn" onclick="removeBoard()">Forget</button>
+    </div>
+
+    <h3>Scripts</h3>
+    <div class="row" id="snips"></div>
+
+    <h3>Bootloader &amp; firmware</h3>
+    <div class="row">
+      <button class="warn" onclick="enterBootloader()">Enter bootloader</button>
+      <label class="note">UF2 <input type="file" id="uf2" accept=".uf2" style="width:150px"></label>
+      <button onclick="upload('/uf2?enter=1&wait=1','uf2')">Flash UF2</button>
+    </div>
+    <div class="note">Bootloader entry goes through the REPL — nothing is written to the board, so
+      it cannot get stuck in a boot loop the way a reset in <code>code.py</code> does.</div>
+
+    <h3>Debug probe</h3>
+    <div class="row">
+      <button onclick="api('POST','/ocd/start')">Start</button>
+      <button onclick="api('POST','/ocd/stop')">Stop</button>
+      <input id="ocdcmd" placeholder="halt" style="flex:1;min-width:90px">
+      <button onclick="ocdCmd()">Run</button>
+    </div>
+    <div class="row">
+      <label class="note">ELF <input type="file" id="elf" style="width:150px"></label>
+      <button onclick="upload('/ocd/flash?verify=1&reset=1','elf')">Flash (SWD)</button>
+    </div>
+  </section>
+
+  </div>
+
+  <section style="grid-column:1/-1">
+    <h2>Files <span id="freeinfo" class="note"></span></h2>
+    <div class="row">
+      <input id="path" placeholder="subdirectory (blank = root)" style="width:210px">
+      <button onclick="listFiles()">List</button>
+      <label class="note"><input type="checkbox" id="rec" style="vertical-align:-2px"> recursive</label>
+      <span style="flex:1"></span>
+      <input id="newdir" placeholder="new directory" style="width:140px">
+      <button onclick="mkdir()">mkdir</button>
+      <label class="note">upload <input type="file" id="up" style="width:150px"></label>
+      <input id="upname" placeholder="as name (optional)" style="width:140px">
+      <button onclick="putFile()">Upload</button>
+    </div>
+    <table id="files"></table>
+  </section>
+</main>
+
+<main id="addform">
+  <section style="grid-column:1/-1">
+    <h2 id="addtitle">Add a board</h2>
+    <div class="row">
+      <label class="note" style="width:90px">id</label>
+      <input id="f-id" placeholder="jam" style="width:140px">
+      <label class="note">label</label><input id="f-label" placeholder="Fruit Jam" style="width:180px">
+    </div>
+    <div class="row">
+      <label class="note" style="width:90px">drive</label>
+      <select id="f-path" style="min-width:240px"></select>
+      <span class="note">the board's USB drive — leave empty for a board without one</span>
+    </div>
+    <div class="row">
+      <label class="note" style="width:90px"></label>
+      <span class="note">A new COM number or drive letter for the same board needs no edit: the agent
+        recognises it by its UID (boot_out.txt = USB serial number) and follows it. Edit to point this entry
+        at different hardware.</span>
+    </div>
+    <div class="row">
+      <label class="note" style="width:90px">serial</label>
+      <select id="f-port" style="min-width:240px"></select>
+      <label class="note">baud</label><input id="f-baud" value="115200" style="width:90px">
+    </div>
+    <div class="row">
+      <label class="note" style="width:90px">HDMI capture</label>
+      <select id="f-video" style="min-width:240px"></select>
+      <input id="f-video-manual" placeholder="or type the device name" style="width:180px">
+      <label class="note">mode <input id="f-video-size" placeholder="640x480" style="width:90px"></label>
+      <span class="note" id="videonote">a capture card shows the board's screen in the panel</span>
+    </div>
+    <div class="row">
+      <label class="note" style="width:90px">files via</label>
+      <select id="f-fs"><option value="auto">auto (drive, else REPL)</option>
+        <option value="msc">drive only</option><option value="repl">serial REPL (no USB drive)</option></select>
+      <label class="note">openocd</label>
+      <select id="f-ocd"><option value="">disabled</option></select>
+    </div>
+    <div class="row">
+      <button onclick="saveBoard()">Save</button>
+      <button onclick="showApp()">Cancel</button>
+      <span class="note" id="addnote"></span>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let BOARDS = [], CUR = null, AUTHED = false, DISCO = {serial:[],drives:[],openocd_cfgs:[]}, TOKENV = localStorage.getItem("devagent_token") || "";
+$("token").value = TOKENV;
+async function saveToken(){                       // a fresh browser starts with no token: everything
+  TOKENV = $("token").value.trim();                // 401s until it is entered, then reload the lot
+  localStorage.setItem("devagent_token", TOKENV);
+  await refresh(); await loadSnippets();
+  if(CUR){ loadInfo(); listFiles(); }
+}
+function q(extra){ const p = new URLSearchParams(extra || {}); if(CUR) p.set("board", CUR); if(TOKENV) p.set("token", TOKENV); return p.toString(); }
+function human(n){ const u = ["B","KB","MB","GB"]; let i = 0;
+  while(n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
+  return (n < 10 && i ? n.toFixed(1) : Math.round(n)) + " " + u[i]; }
+function url(path, extra){ return path + (path.includes("?") ? "&" : "?") + q(extra); }
+async function api(method, path, body){
+  const r = await fetch(url(path), {method, body: body === undefined ? (method === "POST" ? "" : undefined) : body});
+  const j = await r.json().catch(()=>({}));
+  if(j && j.error) TERM.write("\r\n\x1b[31m" + j.error + "\x1b[0m\r\n");
+  refresh(); return j;
+}
+/* Keystrokes go out on ONE chain: separate fetches race, and a scrambled line
+   ("print(6*7)" arriving as "print(6)*7") is impossible to explain to a user.
+   Chaining also batches fast typing into a single request. */
+let OUTQ = "", SENDING = false;
+function send(s){ OUTQ += s; flush(); }
+async function flush(){
+  if(SENDING || !OUTQ) return;
+  SENDING = true;
+  const chunk = OUTQ; OUTQ = "";
+  try { await fetch(url("/serial/write"), {method:"POST", body: chunk}); }
+  catch(e) { OUTQ = chunk + OUTQ; }        // put it back, try again on the next key
+  finally { SENDING = false; if(OUTQ) flush(); }
+}
+
+/* --- terminal: a small VT subset, one scrollback per board so switching tabs keeps history --- */
+const BUFFERS = {};
+function newBuf(){ return {lines:[{c:[],a:[]}], row:0, col:0, attr:"", pend:""}; }
+const TERM = (() => {
+  const el = $("term"), MAX = 4000;
+  const esc = t => t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  function B(){ if(!BUFFERS[CUR]) BUFFERS[CUR] = newBuf(); return BUFFERS[CUR]; }
+  function write(text, id){
+    const b = BUFFERS[id || CUR] || (BUFFERS[id || CUR] = newBuf());
+    let s = b.pend + text; b.pend = "";
+    const line = () => b.lines[b.row];
+    for(let i=0;i<s.length;i++){
+      const ch = s[i];
+      if(ch === "\x1b"){
+        const rest = s.slice(i);
+        let m = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(rest);
+        if(m){
+          const p = m[1], cmd = m[2];
+          if(cmd === "m"){ for(const x of p.split(";")){ const n = parseInt(x||"0",10);
+              if(n===0) b.attr=""; else if(n===1) b.attr=(b.attr+" bold").trim();
+              else if((n>=30&&n<=37)||(n>=90&&n<=97)) b.attr=("f"+n+(b.attr.includes("bold")?" bold":"")).trim(); } }
+          else if(cmd === "K"){ const L = line(); L.c.length = b.col; L.a.length = b.col; }
+          else if(cmd === "C") b.col += parseInt(p||"1",10);
+          else if(cmd === "D") b.col = Math.max(0, b.col - parseInt(p||"1",10));
+          else if(cmd === "J"){ b.lines=[{c:[],a:[]}]; b.row=0; b.col=0; }
+          i += m[0].length - 1; continue;
+        }
+        m = /^\x1b\][^\x07\x1b]*(\x07|\x1b\\)/.exec(rest);      // OSC title: swallow
+        if(m){ i += m[0].length - 1; continue; }
+        if(rest.length < 12){ b.pend = rest; break; }
+        continue;
+      }
+      if(ch === "\n"){ b.row++; b.col=0; if(b.row>=b.lines.length) b.lines.push({c:[],a:[]});
+                       while(b.lines.length>MAX){ b.lines.shift(); b.row--; } }
+      else if(ch === "\r") b.col = 0;
+      else if(ch === "\b") b.col = Math.max(0, b.col-1);
+      else if(ch >= " "){ const L = line();
+        while(L.c.length < b.col){ L.c.push(" "); L.a.push(""); }
+        L.c[b.col] = ch; L.a[b.col] = b.attr; b.col++; }
+    }
+    if((id || CUR) === CUR) render();
+  }
+  function render(){
+    const b = B(), out = [];
+    for(const L of b.lines){
+      let seg = "", cls = null;
+      for(let i=0;i<L.c.length;i++){
+        if(L.a[i] !== cls){ if(seg) out.push(cls?`<span class="${cls}">${esc(seg)}</span>`:esc(seg)); seg=""; cls=L.a[i]; }
+        seg += L.c[i];
+      }
+      if(seg) out.push(cls?`<span class="${cls}">${esc(seg)}</span>`:esc(seg));
+      out.push("\n");
+    }
+    el.innerHTML = out.join("");
+    if($("follow").checked) el.scrollTop = el.scrollHeight;
+  }
+  return {write, render, el, clear:()=>{ BUFFERS[CUR] = newBuf(); render(); }};
+})();
+
+/* keys go straight to the board; the REPL echoes them, so never echo locally */
+const CTRL = {Enter:"\r", Backspace:"\x7f", Tab:"\t", Escape:"\x1b", ArrowUp:"\x1b[A",
+              ArrowDown:"\x1b[B", ArrowRight:"\x1b[C", ArrowLeft:"\x1b[D",
+              Home:"\x1b[H", End:"\x1b[F", Delete:"\x1b[3~"};
+TERM.el.addEventListener("keydown", e => {
+  if(e.metaKey || (e.ctrlKey && (e.key==="c"||e.key==="v") && window.getSelection().toString())) return;
+  let out = null;
+  if(e.ctrlKey && e.key.length === 1){ const c = e.key.toLowerCase().charCodeAt(0)-96; if(c>=1&&c<=26) out = String.fromCharCode(c); }
+  else if(CTRL[e.key] !== undefined) out = CTRL[e.key];
+  else if(e.key.length === 1) out = e.key;
+  if(out !== null){ e.preventDefault(); send(out); }
+});
+TERM.el.addEventListener("paste", e => {
+  e.preventDefault();
+  const t = (e.clipboardData || window.clipboardData).getData("text");
+  if(!t) return;
+  send(t.includes("\n") ? "\x05" + t.replace(/\r?\n/g,"\r") + "\x04" : t);   // paste mode keeps indentation
+});
+TERM.el.addEventListener("focus", ()=> $("termstate").textContent = "· typing goes to the board");
+TERM.el.addEventListener("blur", ()=> $("termstate").textContent = "· click to type");
+
+/* --- console: the board you are looking at is LONG-POLLED, so its echo is one round trip
+   rather than one poll interval; the others get an occasional non-blocking read (ms=0) so
+   their scrollback stays current without each holding a connection open (browsers allow only
+   a handful per host, and the video stream wants one too). --- */
+const PUMPS = new Set(), ABORT = {};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function burl(id, path, extra){
+  const p = new URLSearchParams(extra || {});
+  p.set("board", id);
+  if(TOKENV) p.set("token", TOKENV);
+  return path + "?" + p.toString();
+}
+function pumpAll(){
+  for(const b of BOARDS) if(!PUMPS.has(b.id)){ PUMPS.add(b.id); pumpBoard(b.id); }
+}
+function repump(){ for(const k in ABORT) try { ABORT[k].abort(); } catch(e){} }   // roles changed
+async function pumpBoard(id){
+  while(BOARDS.some(b => b.id === id)){
+    const live = (id === CUR);
+    const ac = new AbortController(); ABORT[id] = ac;
+    try{
+      const t = await (await fetch(burl(id, "/serial/read", {ms: live ? 15000 : 0}),
+                                   {signal: ac.signal})).text();
+      if(t) TERM.write(t, id);
+    }catch(e){
+      if(e.name !== "AbortError") await sleep(700);
+    }
+    delete ABORT[id];
+    if(!live) await sleep(1500);
+  }
+  PUMPS.delete(id);
+}
+
+/* --- boards & tabs --- */
+function tabs(){
+  const t = $("tabs"); t.innerHTML = "";
+  for(const b of BOARDS){
+    const d = document.createElement("div");
+    d.className = "tab" + (b.id === CUR ? " sel" : "");
+    d.textContent = b.label || b.id;
+    d.onclick = () => { stopVideo(); CUR = b.id; repump(); tabs(); TERM.render();
+                        loadInfo(); listFiles(); refresh(); showApp(); };
+    t.appendChild(d);
+  }
+  const add = document.createElement("div");
+  add.className = "tab add"; add.textContent = "＋ board";
+  add.onclick = () => editBoard(true);
+  t.appendChild(add);
+}
+async function refresh(){
+  try{
+    const h = await (await fetch("/health?" + (TOKENV ? "token=" + TOKENV : ""))).json();
+    if(h.error){ AUTHED = false; $("p-agent").textContent = h.error; return; }
+    AUTHED = true;
+    BOARDS = h.boards || [];
+    if(!CUR && BOARDS.length) CUR = BOARDS[0].id;
+    $("p-agent").textContent = "v" + h.agent + " · up " + h.uptime_s + "s" + (h.auth ? " · token" : "");
+    tabs();
+    pumpAll();
+    const b = BOARDS.find(x => x.id === CUR);
+    const pill = (el, cls, txt, title) => { el.textContent = txt; el.className = "pill " + cls
+                                            + (el.classList.contains("edit") ? " edit" : "");
+                                            el.title = title || txt; };
+    if(b){
+      const short = p => p && p.length > 34 ? "…" + p.slice(-33) : p;      // a Linux mount path is long
+      const fix = " — click to point the board elsewhere";
+      pill($("p-drive"), b.drive ? "on" : (b.path ? "off" : "idle"),
+           "drive " + (short(b.drive || b.path) || "none") + (b.path && !b.drive ? " missing" : ""),
+           b.drive ? b.drive : (b.path ? b.path + " is not mounted" + fix : "no drive configured" + fix));
+      // the agent follows a board across a COM-port rename by its UID; what is left to show is
+      // WHY a configured port is silent: gone, or held by another program
+      const serialState = b.serial_open ? "" : (b.port_present === false ? " missing"
+                                                : (b.port_present === true ? " busy" : ""));
+      pill($("p-serial"), b.serial_open ? "on" : (b.port ? "off" : "idle"),
+           "serial " + (b.port || "none") + serialState,
+           b.serial_open ? b.port + (b.uid ? " · UID " + b.uid : "")
+             : b.port_present === false ? b.port + " is not present on the host" + fix
+             : b.port_present === true ? b.port + " exists but cannot be opened — another program (Mu, Thonny, a terminal) holds it?"
+             : b.port ? b.port + " is not open" + fix
+             : "no serial console configured" + fix);
+      pill($("p-fs"), "idle", "fs " + b.fs_mode);
+      pill($("p-ocd"), b.ocd ? (b.openocd ? "on" : "off") : "idle",
+           "openocd " + (b.openocd ? "up :" + b.ocd_ports.tcl : (b.ocd || "none")));
+      pill($("p-boot"), b.in_bootloader ? "off" : "on", b.in_bootloader ? "IN BOOTLOADER" : "running");
+      $("freeinfo").textContent = "";
+      if(b.drive){ const f = await (await fetch(url("/free"))).json();
+        if(f.free !== undefined) $("freeinfo").textContent = "· " + human(f.free) + " free"; }
+      const vb = $("videobox");
+      vb.style.display = b.video ? "" : "none";
+      $("vidnote").textContent = b.video
+        ? ("· " + b.video + (b.video_size ? " @ " + b.video_size : "")
+           + (b.ffmpeg ? "" : " — ffmpeg missing on the agent host")) : "";
+      if(!b.video && VIDON) stopVideo();
+      if(!b.port && !BUFFERS[b.id]) TERM.write(
+        "\x1b[90m(no serial console for this board - add its port with Edit board)\x1b[0m\r\n", b.id);
+    }
+  }catch(e){}
+}
+async function loadSnippets(){
+  const list = await (await fetch("/snippets?" + (TOKENV ? "token=" + TOKENV : ""))).json();
+  const box = $("snips"); box.innerHTML = "";
+  if(!Array.isArray(list)){ box.innerHTML = '<span class="note">' + (list.error || "unavailable") + '</span>'; return; }
+  for(const s of list){
+    const btn = document.createElement("button");
+    btn.className = "small"; btn.textContent = s.label;
+    btn.onclick = async () => {
+      TERM.write("\r\n\x1b[36m— " + s.label + " —\x1b[0m\r\n");
+      const j = await api("POST", "/snippet?id=" + s.id);
+      if(j.output) TERM.write(j.output.replace(/\n/g, "\r\n") + "\r\n");
+      if(j.note) TERM.write("\x1b[33m" + j.note + "\x1b[0m\r\n");
+      else if(!j.error && !(j.output || "").trim()) TERM.write("\x1b[33m(no output)\x1b[0m\r\n");
+    };
+    box.appendChild(btn);
+  }
+}
+async function loadInfo(refreshIt){
+  if(!CUR) return;
+  $("info").innerHTML = '<div><span>info</span><span class="note">probing…</span></div>';
+  const j = await (await fetch(url("/info", refreshIt ? {refresh:1} : {}))).json();
+  if(j.error){ $("info").innerHTML = '<div><span>info</span><span class="note">' + j.error + '</span></div>'; return; }
+  const rows = Object.entries(j).filter(([k]) => k !== "raw_tail" && k !== "probed_at");
+  $("info").innerHTML = rows.length
+    ? rows.map(([k,v]) => `<div><span>${k}</span><span>${String(v)}</span></div>`).join("")
+    : '<div><span>info</span><span class="note">nothing returned</span></div>';
+}
+async function hardReset(){
+  if(!confirm("Hard reset the board?")) return;
+  await api("POST", "/reset?mode=hard");
+}
+
+/* --- the split between console and side column is the user's to set --- */
+const SIDE_MIN = 300;
+function setSide(px){
+  const max = Math.max(SIDE_MIN, window.innerWidth - 340);          // always leave a usable console
+  px = Math.min(max, Math.max(SIDE_MIN, Math.round(px)));
+  document.documentElement.style.setProperty("--side", px + "px");
+  localStorage.setItem("devagent_side", px);
+}
+(() => { const v = parseInt(localStorage.getItem("devagent_side")); if(v) setSide(v); })();
+addEventListener("DOMContentLoaded", () => {
+  const g = $("grip");
+  g.addEventListener("pointerdown", e => {
+    e.preventDefault(); g.classList.add("on");
+    const move = ev => setSide(innerWidth - ev.clientX - 22);
+    const up = () => { g.classList.remove("on");
+      removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
+    addEventListener("pointermove", move); addEventListener("pointerup", up);
+  });
+  g.addEventListener("dblclick", () => {            // snap to the captured picture, shown 1:1
+    const w = $("vid").naturalWidth;
+    if(w){ $("vid11").checked = true; fit(); setSide(w + 26); }
+  });
+});
+
+/* --- HDMI capture: an MJPEG stream straight into an <img>, no player --- */
+let VIDON = false;
+function videoUrl(){ return url("/video", {w: $("vidw").value, fps: $("vidfps").value, t: Date.now()}); }
+function fit(){ $("vid").style.width = $("vid11").checked ? "auto" : "100%"; }
+function stopVideo(){                       // dropping the connection is what stops ffmpeg
+  VIDON = false; const v = $("vid");
+  v.removeAttribute("src"); v.style.display = "none"; $("vidbtn").textContent = "Start";
+}
+function toggleVideo(){
+  if(VIDON) return stopVideo();
+  VIDON = true; const v = $("vid");
+  v.style.display = ""; v.src = videoUrl(); $("vidbtn").textContent = "Stop"; fit();
+}
+function restartVideo(){ if(VIDON){ stopVideo(); toggleVideo(); } }
+function snapshot(){ window.open(url("/snapshot", {w: $("vidw").value, t: Date.now()}), "_blank"); }
+             // a snapshot joins the running stream now, so it works while the panel is live
+
+/* --- add / edit board --- */
+function showApp(){ $("app").style.display = "grid"; $("addform").style.display = "none"; }
+async function editBoard(isNew){
+  DISCO = await (await fetch("/discover?" + (TOKENV ? "token=" + TOKENV : ""))).json();
+  if(DISCO.error){ alert(DISCO.error); return; }
+  DISCO.drives = DISCO.drives || []; DISCO.serial = DISCO.serial || []; DISCO.openocd_cfgs = DISCO.openocd_cfgs || [];
+  const b = isNew ? {} : (BOARDS.find(x => x.id === CUR) || {});
+  const fill = (sel, items, cur, blank) => {
+    sel.innerHTML = blank ? '<option value="">— none —</option>' : "";
+    for(const it of items){
+      const o = document.createElement("option");
+      o.value = it.value; o.textContent = it.text; if(it.value === cur) o.selected = true;
+      sel.appendChild(o);
+    }
+    if(cur && !items.some(i => i.value === cur)){          // keep a value the host cannot see now
+      const o = document.createElement("option"); o.value = cur; o.textContent = cur + " (not present)";
+      o.selected = true; sel.appendChild(o);
+    }
+  };
+  // name the hardware, not just the letter: boot_out.txt names the board on a drive, and its UID
+  // is the USB serial number, so a port is labelled with the same name when both are visible
+  const byUid = {}; for(const d of DISCO.drives) if(d.uid) byUid[d.uid] = d;
+  const usedBy = (field, value) => { const o = BOARDS.find(x => x.id !== b.id && value && x[field] === value);
+                                     return o ? "  · used by " + (o.label || o.id) : ""; };
+  fill($("f-path"), DISCO.drives.map(d => ({value:d.path,
+         text:d.path + (d.circuitpy ? "  ← " + (d.board || "CIRCUITPY") : "") + usedBy("path", d.path)})),
+       b.path, true);
+  fill($("f-port"), DISCO.serial.map(s => ({value:s.device,
+         text:s.device + " — " + ((s.serial_number && byUid[s.serial_number]) ? byUid[s.serial_number].board
+                                  : (s.description || "")) + usedBy("port", s.device)})),
+       b.port, true);
+  fill($("f-ocd"), (DISCO.openocd_cfgs||[]).map(c => ({value:c, text:c})), b.ocd, true);
+  fill($("f-video"), (DISCO.video||[]).map(v => ({value:v, text:v}))
+                       .concat([{value:"test", text:"test pattern (no card - checks the plumbing)"}]),
+       b.video, true);
+  $("f-video-manual").value = "";
+  $("f-video-size").value = b.video_size || "";
+  $("videonote").textContent = DISCO.video_error                    // never an empty list with no reason
+    ? DISCO.video_error
+    : "a capture card shows the board's screen in the panel";
+  $("videonote").style.color = DISCO.video_error ? "#e2564a" : "";
+  if(DISCO.video_raw) console.log("ffmpeg -list_devices said:\n" + DISCO.video_raw);
+  $("f-id").value = b.id || ""; $("f-id").disabled = !isNew && !!b.id;
+  $("f-label").value = b.label || ""; $("f-baud").value = b.baud || 115200;
+  $("f-fs").value = b.fs || "auto";
+  $("addtitle").textContent = isNew ? "Add a board" : ("Edit " + (b.label || b.id) + (b.uid ? " · UID " + b.uid : ""));
+  $("addnote").textContent = "";
+  $("app").style.display = "none"; $("addform").style.display = "grid";
+}
+async function saveBoard(){
+  const spec = {id: $("f-id").value.trim(), label: $("f-label").value.trim(),
+                path: $("f-path").value || null, port: $("f-port").value || null,
+                baud: parseInt($("f-baud").value) || 115200,
+                ocd: $("f-ocd").value || null, fs: $("f-fs").value,
+                video: $("f-video-manual").value.trim() || $("f-video").value || null,
+                video_size: $("f-video-size").value.trim() || null};
+  if(!spec.id){ $("addnote").textContent = "an id is required"; return; }
+  const r = await fetch("/boards?" + (TOKENV ? "token=" + TOKENV : ""), {method:"POST", body: JSON.stringify(spec)});
+  const j = await r.json();
+  if(j.error){ $("addnote").textContent = j.error; return; }
+  CUR = spec.id; showApp(); await refresh(); loadInfo(); listFiles();
+}
+async function removeBoard(){
+  if(!CUR || !confirm("Forget board " + CUR + "? (the board itself is untouched)")) return;
+  await fetch("/boards?id=" + CUR + (TOKENV ? "&token=" + TOKENV : ""), {method:"DELETE"});
+  CUR = null; await refresh(); if(CUR){ loadInfo(); listFiles(); }
+}
+
+/* --- files --- */
+async function listFiles(){
+  if(!CUR) return;
+  const rows = await (await fetch(url("/list", {dir:$("path").value.trim(), recursive:$("rec").checked?1:0}))).json();
+  const t = $("files"); t.innerHTML = "";
+  if(!Array.isArray(rows)){ t.innerHTML = `<tr><td class="note">${rows.error}</td></tr>`; return; }
+  for(const e of rows){
+    const base = $("path").value.trim();
+    const full = (base ? base.replace(/\/$/,"") + "/" : "") + e.name;
+    const tr = document.createElement("tr");
+    tr.innerHTML = e.dir
+      ? `<td>📁 <a href="#" onclick="$('path').value='${full}';listFiles();return false">${e.name}/</a></td>
+         <td class="sz"></td><td class="act"><button class="small" onclick="rmdir('${full}')">rm -r</button></td>`
+      : `<td><a href="${url("/file", {name: full})}" download>${e.name}</a></td>
+         <td class="sz">${e.size}</td><td class="act"><button class="small" onclick="rmFile('${full}')">delete</button></td>`;
+    t.appendChild(tr);
+  }
+}
+async function rmFile(n){ if(!confirm("Delete " + n + "?")) return;
+  await fetch(url("/file", {name:n}), {method:"DELETE"}); listFiles(); }
+async function rmdir(n){ if(!confirm("Remove " + n + " and everything in it?")) return;
+  await fetch(url("/dir", {name:n, recursive:1}), {method:"DELETE"}); listFiles(); }
+async function mkdir(){ const d = $("newdir").value.trim(); if(!d) return;
+  const base = $("path").value.trim();
+  await fetch(url("/mkdir", {name: base ? base.replace(/\/$/,"") + "/" + d : d}), {method:"POST", body:""});
+  $("newdir").value = ""; listFiles(); }
+async function putFile(){
+  const f = $("up").files[0]; if(!f) return alert("pick a file first");
+  const base = $("path").value.trim(), name = ($("upname").value.trim() || f.name);
+  const full = base ? base.replace(/\/$/,"") + "/" + name : name;
+  const r = await fetch(url("/file", {name: full}), {method:"PUT", body: await f.arrayBuffer()});
+  const j = await r.json();
+  if(j.error) alert(j.error);                                  // e.g. the bootloader-loop guard
+  else if(j.matches_sent === false) alert("WRITE MISMATCH — the bytes on the board differ!");
+  listFiles();
+}
+
+/* --- board actions --- */
+async function enterBootloader(){
+  if(!confirm("Put the board into the bootloader?\n\nIts drive and serial port disappear until it is flashed or reset.")) return;
+  const j = await api("POST", "/bootloader/enter?method=repl&timeout=25");
+  alert(j.volume ? ("bootloader volume: " + j.volume) : ("no volume appeared: " + (j.error || "?")));
+}
+async function upload(path, inputId){
+  const f = $(inputId).files[0]; if(!f) return alert("pick a file first");
+  const r = await fetch(url(path), {method:"POST", body: await f.arrayBuffer()});
+  const j = await r.json();
+  alert(j.error ? ("error: " + j.error) : (j.ok ? "OK" + (j.note ? " — " + j.note : "") : JSON.stringify(j).slice(0,300)));
+  refresh();
+}
+async function ocdCmd(){
+  const j = await api("POST", "/ocd/cmd", $("ocdcmd").value);
+  TERM.write("\r\n\x1b[36m$ " + $("ocdcmd").value + "\x1b[0m\r\n" + (j.output || "") + "\r\n");
+}
+
+(async () => {
+  await refresh(); await loadSnippets();
+  if(CUR){ loadInfo(); listFiles(); }
+  else if(!AUTHED) $("token").focus();     // the agent wants a token before it will say anything
+  else editBoard(true);                    // nothing configured yet - start with the form
+  setInterval(refresh, 4000);
+})();
+</script>

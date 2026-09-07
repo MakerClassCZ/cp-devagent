@@ -1,0 +1,6 @@
+# per-machine state: board list + token
+devagent.json
+devagent.json.tmp
+__pycache__/
+*.pyc
+.venv/
