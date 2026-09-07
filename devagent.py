@@ -77,6 +77,7 @@ from urllib.parse import urlparse, parse_qs
 
 AGENT_VERSION = 8
 LOG_KEEP = 512 * 1024              # chars of console history kept for /serial/tail
+BUF_KEEP = 256 * 1024              # chars of unread console output kept for /serial/read
 RELINK_EVERY = 2.0                 # s between looks for a board's port/drive under a new name
 STARTED = time.time()
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,6 +98,18 @@ except ImportError:
     cpfs = None
 
 REPL_MARK = "--devagent--"                            # separates paste-mode echo from real output
+
+
+def repl_done(text):
+    """True once the board PRINTED the marker (on a line of its own - the paste-mode echo of
+    print("...") carries the same word) and is back at its prompt: the script has run."""
+    at = max(text.rfind(REPL_MARK + "\r"), text.rfind(REPL_MARK + "\n"))
+    return at >= 0 and text[at:].rstrip().endswith(">>>")
+
+
+def code_done(text):
+    """True once CircuitPython says the program in code.py finished."""
+    return "Code done running." in text
 _FFMPEG_OK = None                                    # ffmpeg present? probed once
 OCD_CFGS = {
     "rp2350": ("interface/cmsis-dap.cfg", "target/rp2350.cfg", "adapter speed 5000"),
@@ -236,6 +249,10 @@ def snippets():
     return out
 
 
+class ConsoleError(RuntimeError):
+    """The board's REPL cannot be reached: no port, port busy, or the write failed."""
+
+
 class DriveMissing(Exception):
     """The board's drive is not there (unplugged, resetting, not mounted) or was refused."""
 
@@ -291,14 +308,16 @@ class Board:
         self.port_present = None                     # last relink() verdict: None = not checked yet
         self._relink_at = 0.0
         self._relink_lock = threading.Lock()
-        self.buf = deque(maxlen=4000)
+        self.buf = deque()                           # unread console output (drain); BUF_KEEP chars
+        self.buf_len = 0
         self.buf_lock = threading.Lock()
         self.log = []                                # everything said, for cursor reads (tail)
         self.log_len = 0                             # chars in log
         self.log_base = 0                            # absolute offset of log[0]
         self.taps = []                               # extra readers; see tap()
         self.exclusive = 0                           # >0: a script owns the stream, console pauses
-        self.wake = threading.Condition()            # "new console output" signal
+        self.wake = threading.Condition(self.buf_lock)   # "new console output"; shares the buffer
+                                                     # lock so a check-then-wait cannot miss a wake-up
         self.repl_lock = threading.RLock()
         self.ser = None
         self.ser_lock = threading.RLock()
@@ -489,6 +508,9 @@ class Board:
         with self.buf_lock:
             if not self.exclusive:                   # a script's own echo is noise in the console
                 self.buf.append(text)
+                self.buf_len += len(text)
+                while self.buf_len > BUF_KEEP and len(self.buf) > 1:
+                    self.buf_len -= len(self.buf.popleft())
             if to_taps:
                 for t in self.taps:                  # every listener gets its own copy
                     t.append(text)
@@ -498,7 +520,6 @@ class Board:
                 old = self.log.pop(0)
                 self.log_len -= len(old)
                 self.log_base += len(old)
-        with self.wake:
             self.wake.notify_all()                   # a waiting console read returns at once
 
     @contextlib.contextmanager
@@ -523,25 +544,33 @@ class Board:
                 if exclusive:
                     self.exclusive = max(0, self.exclusive - 1)
 
-    def collect(self, sink, ms, quiet=0.4):
-        """Read a tap until it goes quiet for `quiet` seconds, or `ms` runs out."""
-        deadline, last, seen = time.time() + ms / 1000.0, time.time(), 0
-        while time.time() < deadline:
-            with self.buf_lock:
-                n = len(sink)
-            if n > seen:
-                seen, last = n, time.time()
-            elif seen and time.time() - last > quiet:
-                break
-            time.sleep(0.05)
+    def collect(self, sink, ms, done=None):
+        """Read a tap for `ms`; return earlier only when `done(text)` says the run is over.
+        (It used to stop after 0.4 s of silence, which cut off `print; sleep(1); print` after
+        the first line and handed a slow script's output to whoever asked next.)"""
+        deadline, seen = time.time() + ms / 1000.0, 0
+        while True:
+            with self.wake:
+                if len(sink) > seen:
+                    seen = len(sink)
+                    if done and done("".join(sink)):
+                        break
+                left = deadline - time.time()
+                if left <= 0:
+                    break
+                self.wake.wait(min(0.25, left))
         with self.buf_lock:
             return "".join(sink)
 
+    def _take_locked(self):
+        got = "".join(self.buf)
+        self.buf.clear()
+        self.buf_len = 0
+        return got
+
     def take(self):
         with self.buf_lock:
-            got = list(self.buf)
-            self.buf.clear()
-        return "".join(got)
+            return self._take_locked()
 
     def tail(self, frm, ms, stop=None):
         """Console output from absolute offset `frm` on, without consuming anything: the reply
@@ -556,16 +585,18 @@ class Board:
             return {"next": end, "text": ""}
         deadline = time.time() + ms / 1000.0
         while True:
-            with self.buf_lock:
+            with self.wake:
                 end = self.log_base + self.log_len
                 if end > frm:
                     start = max(frm, self.log_base)      # older than we keep: skip, flag the gap
                     text = "".join(self.log)[start - self.log_base:]
                     return {"next": end, "text": text, "gap": start != frm}
-            if time.time() >= deadline or (stop and stop()):
+                left = deadline - time.time()
+                if left <= 0:
+                    return {"next": end, "text": ""}
+                self.wake.wait(min(0.25, left))
+            if stop and stop():
                 return {"next": end, "text": ""}
-            with self.wake:
-                self.wake.wait(min(0.25, max(0.0, deadline - time.time())))
 
     def drain(self, ms, coalesce=0.015, stop=None):
         """Console output, long-poll style: return the moment anything is there (after a blink to
@@ -579,16 +610,19 @@ class Board:
         if out or ms <= 0:
             return out
         deadline = time.time() + ms / 1000.0
-        while time.time() < deadline:
+        while True:
             with self.wake:
-                self.wake.wait(min(0.25, max(0.0, deadline - time.time())))
-            if stop and stop():
-                return ""
-            out = self.take()
+                if not self.buf:
+                    left = deadline - time.time()
+                    if left <= 0:
+                        return ""
+                    self.wake.wait(min(0.25, left))
+                out = self._take_locked()
             if out:
                 time.sleep(coalesce)                 # let the rest of the burst land
                 return out + self.take()
-        return ""
+            if stop and stop():
+                return ""
 
     def send(self, data):
         with self.ser_lock:
@@ -603,6 +637,16 @@ class Board:
                 self.ser = None
                 return False
 
+    def send_or_raise(self, data, slice_size=256):
+        """send() for scripted runs: a failure is an error, not a silent half-paste. Written in
+        slices with the port lock released in between, so the reader can take the echo the
+        board sends back - a board whose echo nobody reads stops reading itself."""
+        for at in range(0, len(data), slice_size):
+            if not self.send(data[at:at + slice_size]):
+                raise ConsoleError("console write to %s failed (port gone?)" % self.port)
+            if at + slice_size < len(data):
+                time.sleep(0.005)
+
     # ---- running code in the REPL (never touches the filesystem) ----
     def console_error(self):
         """Why the REPL is unreachable, or None. Every REPL-driven action asks first, so a
@@ -611,8 +655,9 @@ class Board:
             return "pyserial is not installed on the agent host (pip install pyserial)"
         if not self.port:
             return "no serial console configured for board %r" % self.id
-        if self.open_serial() is None:
-            return "cannot open %s (in use by another program?)" % self.port
+        with self.ser_lock:
+            if self.open_serial() is None:
+                return "cannot open %s (in use by another program?)" % self.port
         return None
 
     def run_repl(self, code, ms=6000):
@@ -621,18 +666,18 @@ class Board:
         Reads through a tap, so the console keeps showing the run as it happens."""
         err = self.console_error()
         if err:
-            raise RuntimeError(err)
+            raise ConsoleError(err)
         with self.repl_lock:                              # two scripts at once would interleave
             with self.tap(exclusive=True) as sink:
-                self.send(b"\x03")
+                self.send_or_raise(b"\x03")
                 time.sleep(0.25)
-                self.send(b"\x05")                        # Ctrl-E: paste mode
+                self.send_or_raise(b"\x05")               # Ctrl-E: paste mode
                 time.sleep(0.15)
                 marked = 'print("%s")\n%s' % (REPL_MARK, code)
-                self.send(marked.replace("\r\n", "\n").replace("\n", "\r").encode())
+                self.send_or_raise(marked.replace("\r\n", "\n").replace("\n", "\r").encode())
                 time.sleep(0.1)
-                self.send(b"\x04")                        # Ctrl-D: run it
-                out = self.collect(sink, ms)
+                self.send_or_raise(b"\x04")               # Ctrl-D: run it
+                out = self.collect(sink, ms, done=repl_done)
         # Paste mode echoes every line back, so the raw capture is the script itself followed by
         # its output. The marker is printed AFTER the echo, so the last one splits the two.
         if REPL_MARK in out:
@@ -921,16 +966,20 @@ class Board:
             self.send(b"microcontroller.on_next_reset(microcontroller.RunMode.BOOTLOADER)\r\n")
             time.sleep(0.2)
             self.send(b"microcontroller.reset()\r\n")
+        touch_error = None
         if method in ("touch", "auto") and serial is not None and self.port:
-            try:
-                self.close_serial()
-                s = serial.Serial(self.port, 1200)
-                time.sleep(0.2)
-                s.close()
-            except Exception:
-                pass
+            with self.ser_lock:                       # keeps the reader from reopening the port
+                self.close_serial()                   # in between: ours must be the LAST close,
+                try:                                  # or DTR never drops and nothing happens
+                    s = serial.Serial(self.port, 1200)
+                    s.dtr = False
+                    time.sleep(0.2)
+                    s.close()
+                except Exception as e:
+                    touch_error = repr(e)
         vol = wait_for(uf2_volume, timeout)
         return {"volume": vol, "info": uf2_info(vol) if vol else [],
+                "touch_error": touch_error,
                 "error": None if vol else "no UF2 volume appeared within %.0fs" % timeout}
 
 
@@ -945,17 +994,22 @@ class ReplFs:
             raise RuntimeError("cpfs.py not found - needed for REPL file access "
                                "(MakerClassCZ/circuitpython-filesystem)")
         self.board.ser_lock.acquire()
-        self.board.close_serial()
-        self.repl = cpfs.SerialREPL(self.board.port, self.board.baud)
-        self.repl.connect()
-        return cpfs.CircuitPythonFS(self.repl)
+        try:
+            self.board.close_serial()
+            self.repl = cpfs.SerialREPL(self.board.port, self.board.baud)
+            self.repl.connect()
+            return cpfs.CircuitPythonFS(self.repl)
+        except BaseException:                         # a lock left held here froze every later
+            self.board.ser_lock.release()             # console read and write
+            raise
 
     def __exit__(self, *exc):
         try:
             self.repl.disconnect()
         except Exception:
             pass
-        self.board.ser_lock.release()
+        finally:
+            self.board.ser_lock.release()
         return False
 
 
@@ -1766,7 +1820,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 out = b.run_repl(body.decode("utf-8", "replace"),
                                  int(q.get("ms", ["6000"])[0]))
-            except Exception as e:
+            except ConsoleError as e:
                 return self._json(503, {"error": str(e)})
             return self._json(200, {"output": out})
         if u.path == "/snippet":
@@ -1776,7 +1830,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"error": "no snippet %r" % sid})
             try:
                 out = b.run_repl(snip["code"], int(q.get("ms", ["6000"])[0]))
-            except Exception as e:
+            except ConsoleError as e:
                 return self._json(503, {"error": str(e)})
             note = None
             if not out.strip():
@@ -1837,16 +1891,13 @@ class Handler(BaseHTTPRequestHandler):
                 why = autorun_guard(name, body)
                 if why:
                     return self._json(409, {"error": why})
-            try:
-                res = b.write(name, body)
-            except Exception as e:
-                return self._json(500, {"error": repr(e)})
-            time.sleep(0.4)
-            b.drain(200)
-            b.send(b"\x03")
-            time.sleep(0.3)
-            b.send(b"\x04")
-            res["output"] = b.drain(int(q.get("ms", ["8000"])[0]))
+            with b.tap() as sink:                     # a private copy: the panel's console poll
+                res = b.write(name, body)             # would otherwise take the output first
+                time.sleep(0.4)
+                b.send(b"\x03")
+                time.sleep(0.3)
+                b.send(b"\x04")
+                res["output"] = b.collect(sink, int(q.get("ms", ["8000"])[0]), done=code_done)
             return self._json(200, res)
         return self._json(404, {"error": "unknown path"})
 
