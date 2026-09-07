@@ -53,6 +53,8 @@ Endpoints (all take ?board=<id>; with one board configured it is optional)
 """
 import argparse
 import ast
+import atexit
+import collections
 import contextlib
 import errno
 import glob
@@ -65,6 +67,7 @@ import posixpath
 import re
 import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1315,6 +1318,24 @@ def add_board(spec):
     return new
 
 
+def shutdown_all():
+    """Leave nothing behind: every openocd, every console, every ffmpeg. Runs on /shutdown,
+    SIGTERM, Ctrl-C and at exit - a killed agent used to leave openocd holding the probe
+    and ffmpeg holding the capture card until someone found them in the process list."""
+    with BOARDS_LOCK:
+        boards = list(BOARDS.values())
+    for b in boards:
+        try:
+            b.ocd_stop()
+            b.close_serial()
+        except Exception:
+            pass
+    with CAPTURES_LOCK:
+        caps = list(CAPTURES.values())
+    for cap in caps:
+        cap.kill()
+
+
 def retire(board):
     """A board taken out of BOARDS: its reader must stop and never reopen the port."""
     board.dead = True
@@ -1480,36 +1501,59 @@ class Capture:
         self.cond = threading.Condition()
 
     def _pump(self, proc):
+        # ffmpeg's stderr is read by its own thread: a chatty ffmpeg (a v4l2 warning per
+        # frame) used to fill the pipe, block, and the stream froze after a few seconds.
+        stderr_tail = collections.deque(maxlen=20)
+
+        def drain():
+            for line in iter(proc.stderr.readline, b""):
+                stderr_tail.append(line)
+        drainer = threading.Thread(target=drain, daemon=True)
+        drainer.start()
         try:
             for jpg in jpeg_frames(proc):
                 with self.cond:
                     self.frame, self.seq = jpg, self.seq + 1
                     self.cond.notify_all()
         finally:
-            tail = b""
-            try:
-                tail = proc.stderr.read() or b""
-            except Exception:
-                pass
-            with self.cond:
-                if proc is self.proc:
-                    self.proc = None
-                    if self.frame is None:
-                        self.err = tail.decode("utf-8", "replace").strip()[-400:] or "ffmpeg stopped"
-                    self.cond.notify_all()
             try:
                 proc.kill()
                 proc.wait(timeout=3)
             except Exception:
                 pass
+            drainer.join(timeout=2)
+            tail = b"".join(stderr_tail).decode("utf-8", "replace").strip()[-400:]
+            with self.cond:
+                if proc is self.proc:
+                    self.proc = None
+                    if self.frame is None:
+                        self.err = tail or "ffmpeg stopped"
+                    self.cond.notify_all()
 
     def acquire(self):
         with self.cond:
-            self.users += 1
             if self.proc is None:
                 self.err = None
-                self.proc = video_proc(self.dev, self.width, self.fps, size=self.size)
+                self.frame = None          # a frame from the last run must not pass as live
+                try:
+                    self.proc = video_proc(self.dev, self.width, self.fps, size=self.size)
+                except OSError as e:       # no ffmpeg binary after all, or it cannot spawn
+                    self.err = "cannot start ffmpeg: %s" % e
+                    raise
                 threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
+            self.users += 1
+
+    def kill(self):
+        """Stop ffmpeg regardless of viewers (agent shutdown)."""
+        with self.cond:
+            proc, self.proc = self.proc, None
+            self.cond.notify_all()
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
 
     def release(self):
         with self.cond:
@@ -1558,7 +1602,7 @@ def jpeg_frames(proc):
     """Split ffmpeg's MJPEG stdout into whole JPEGs (SOI ffd8 .. EOI ffd9)."""
     buf = b""
     while True:
-        chunk = proc.stdout.read(16384)
+        chunk = proc.stdout.read1(16384)   # read(): blocks until 16 KB - a frame's worth of lag
         if not chunk:
             if buf.startswith(b"\xff\xd8"):
                 yield buf
@@ -1635,6 +1679,20 @@ def is_loopback(bind):
         return bind in ("localhost", "") or ipaddress.ip_address(bind).is_loopback
     except ValueError:
         return False
+
+
+SERVER = None
+
+
+def stop_server():
+    """Let the reply go out, stop accepting, clean up; and if serve_forever does not return
+    in time (a streaming /video holding on), leave the hard way."""
+    time.sleep(0.2)
+    if SERVER is not None:
+        SERVER.shutdown()
+    time.sleep(3)
+    shutdown_all()
+    os._exit(0)
 
 
 class Server(ThreadingHTTPServer):
@@ -1953,7 +2011,7 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         if u.path == "/shutdown":
-            threading.Thread(target=lambda: (time.sleep(0.2), os._exit(0)), daemon=True).start()
+            threading.Thread(target=stop_server, daemon=True).start()
             return self._json(200, {"shutdown": True})
         if u.path == "/boards":
             spec = json.loads(body.decode("utf-8") or "{}")
@@ -2182,17 +2240,22 @@ def main():
         print("  auth: none - reachable from this machine only")
     else:
         print("  auth: OPEN (--open) - anyone on this network can write files and flash firmware")
+    global SERVER
     try:
-        srv = Server((ARGS.bind, ARGS.port), Handler)
+        SERVER = Server((ARGS.bind, ARGS.port), Handler)
     except OSError as e:
         if e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048)):
             print("ERROR: %s:%d is already in use." % (ARGS.bind, ARGS.port))
             return 1
         raise
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    atexit.register(shutdown_all)
     try:
-        srv.serve_forever()
+        SERVER.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        shutdown_all()
     return 0
 
 
