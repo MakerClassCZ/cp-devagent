@@ -4,8 +4,8 @@
     python devagent_client.py --host 192.168.1.150 --port 8101 [--board jam] [--token T] health
     ... list [--dir sub] [--recursive]     get REMOTE [LOCAL]     put LOCAL [REMOTE]
     ... rm REMOTE      mkdir DIR      rmdir DIR [--recursive]     free      ports
-    ... read [--ms 3000]      reboot      run FILE [--as code.py] [--ms 20000]
-    ... repl "python one-liner" [--ms 4000]
+    ... read [--ms 3000]      tail [--from N] [--ms 3000]      reboot
+    ... run FILE [--as code.py] [--ms 20000]         repl "python one-liner" [--ms 6000]
     ... boards      board port=COM7 [path=M:\\ ...]      forget [ID]     (edit / add / drop)
     ... info [refresh]      snippets      snippet i2c      reset [soft|hard]
     ... snapshot [OUT.jpg] [--width 640]                 (HDMI capture, if the board has one)
@@ -23,57 +23,109 @@ Importable too, which is the point - a session should not re-derive this:
 `repl` pastes into the REPL WITHOUT writing the drive - use it for anything that resets the
 board, since a reset left in code.py re-runs on every boot and traps the board in a loop.
 Every put verifies against the sha256 the agent read back from the drive.
+
+Errors are exceptions: DevError(status, message) for anything the agent refused (4xx/5xx,
+the message is the agent's own), DevUnreachable when no agent answers. The CLI prints the
+message and exits 1 (2 for unreachable).
 """
 import argparse
 import cmd
 import glob
+import http.client
 import json
 import shlex
 import os
 import sys
 import threading
 import time
+import socket
 import urllib.error
 import urllib.request
 from urllib.parse import quote
 
 
+class DevError(RuntimeError):
+    """The agent answered with an error. `status` is the HTTP status (400 = the request, 404 =
+    no such file/board, 409 = refused for the board's sake, 503 = the board or a tool is not
+    usable right now, 502 = a tool ran and failed), `message` the agent's own words, `body`
+    the whole reply."""
+    def __init__(self, status, message, body=None):
+        super().__init__(message)
+        self.status, self.message, self.body = status, message, body or {}
+
+
+class DevUnreachable(DevError):
+    """No agent answered at all (host asleep, agent not started, wrong port)."""
+    def __init__(self, base, reason):
+        super().__init__(0, "devagent unreachable at %s (%s) - is it running there? "
+                            "`python devagent.py --port %s` on the host, `health` here to check"
+                         % (base, reason, base.rsplit(":", 1)[1]))
+
+
+def _qs(**params):
+    """?k=v&... for the given params, skipping None; True/False become 1/0; values are
+    URL-quoted, so a file named 'a b&c.py' or a token with '+' arrives intact."""
+    parts = []
+    for k, v in params.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            v = int(v)
+        parts.append("%s=%s" % (k, quote(str(v), safe="")))
+    return ("?" + "&".join(parts)) if parts else ""
+
+
 class Dev:
     def __init__(self, host, port=8100, timeout=120, board=None, token=None):
         self.base = "http://%s:%d" % (host, port)
-        self.timeout = timeout
+        self.timeout = timeout      # seconds, for requests without a natural bound of their own
         self.board = board          # which board on this agent (only needed if it has several)
         self.token = token
 
     # ---- plumbing ----
-    def _url(self, path):
-        extra = []
+    def _url(self, path, **params):
         if self.board:
-            extra.append("board=" + quote(self.board))
-        if not extra:
-            return self.base + path
-        return self.base + path + ("&" if "?" in path else "?") + "&".join(extra)
+            params["board"] = self.board
+        return self.base + path + _qs(**params)
 
-    def _req(self, method, path, data=None, timeout=None, raw=False):
-        req = urllib.request.Request(self._url(path), data=data, method=method,
+    def _req(self, verb, path, data=None, deadline=None, raw=False, **params):
+        req = urllib.request.Request(self._url(path, **params), data=data, method=verb,
                                      headers={"X-Token": self.token} if self.token else {})
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+            with urllib.request.urlopen(req, timeout=deadline or self.timeout) as r:
                 body = r.read()
         except urllib.error.HTTPError as e:
             body = e.read()
+            try:
+                parsed = json.loads(body.decode("utf-8", "replace"))
+            except Exception:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            msg = parsed.get("error") or body.decode("utf-8", "replace").strip() or e.reason
+            raise DevError(e.code, "%s (HTTP %d)" % (msg, e.code), parsed)
         except urllib.error.URLError as e:
-            # An unreachable agent is the single most common failure here (host asleep,
-            # agent not started, wrong port) - say that in one line, not a traceback.
-            raise SystemExit("devagent unreachable at %s (%s).\n"
-                             "  Is it running on the host? python devagent.py --path ... --port %s"
-                             % (self.base, e.reason, self.base.rsplit(":", 1)[1]))
+            raise DevUnreachable(self.base, e.reason)
+        except socket.timeout:
+            raise DevError(0, "no answer from %s within %ss" % (self.base, deadline or self.timeout))
+        except (OSError, http.client.HTTPException) as e:    # the agent died mid-request
+            raise DevUnreachable(self.base, e)
         if raw:
             return body
         try:
             return json.loads(body.decode("utf-8", "replace"))
         except Exception:
             return body.decode("utf-8", "replace")
+
+    def _board_id(self, id=None):
+        """The board an edit applies to: the given id, the selected one, else the agent's only
+        board - never a guess between several."""
+        if id or self.board:
+            return id or self.board
+        ids = [b["id"] for b in self.boards()]
+        if len(ids) == 1:
+            return ids[0]
+        raise DevError(400, "which board? pass --board ID (configured: %s)" % (ids or "none"))
 
     # ---- info ----
     def health(self):
@@ -94,31 +146,31 @@ class Dev:
         the rest keep their values (None clears one). A new id needs at least a drive or a port.
         Not needed for the same board on a new COM number / drive letter - the agent follows
         it by UID on its own."""
-        return self._req("POST", "/boards", json.dumps(dict(fields, id=id or self.board)).encode())
+        return self._req("POST", "/boards", json.dumps(dict(fields, id=self._board_id(id))).encode())
 
     def forget_board(self, id=None):
-        return self._req("DELETE", "/boards?id=%s" % (id or self.board))
+        return self._req("DELETE", "/boards", id=self._board_id(id))
 
     def info(self, refresh=False):
         """Board identity (CP version, board id, free RAM). Probed once, then cached by the agent."""
-        return self._req("GET", "/info?refresh=%d" % (1 if refresh else 0))
+        return self._req("GET", "/info", refresh=refresh)
 
     def snippets(self):
         return self._req("GET", "/snippets")
 
     def snippet(self, sid, ms=6000):
         """Run one of the agent's canned scripts (i2c, pins, mem, ...) and return its output."""
-        return self._req("POST", "/snippet?id=%s&ms=%d" % (quote(sid), ms), data=b"")
+        return self._req("POST", "/snippet", data=b"", deadline=ms / 1000 + 30, id=sid, ms=ms)
 
     def reset(self, mode="soft"):
-        return self._req("POST", "/reset?mode=" + mode, data=b"")
+        return self._req("POST", "/reset", data=b"", mode=mode)
 
     def snapshot(self, path=None, width=640):
         """One frame from the board's HDMI capture. Returns the JPEG, or writes it to `path`.
         This is how a session SEES the board's screen - use it to check what a game renders."""
-        data = self._req("GET", "/snapshot?w=%d" % width, raw=True)
+        data = self._req("GET", "/snapshot", raw=True, w=width)
         if data[:2] != b"\xff\xd8":
-            raise RuntimeError(data[:300].decode("utf-8", "replace"))
+            raise DevError(0, "not a JPEG: %s" % data[:300].decode("utf-8", "replace"))
         if path:
             with open(path, "wb") as f:
                 f.write(data)
@@ -129,24 +181,32 @@ class Dev:
 
     # ---- files ----
     def list(self, dir="", recursive=False):
-        return self._req("GET", "/list?dir=%s&recursive=%d" % (dir, 1 if recursive else 0))
+        return self._req("GET", "/list", dir=dir, recursive=recursive)
 
     def get(self, remote):
-        return self._req("GET", "/file?name=" + remote, raw=True)
+        return self._req("GET", "/file", raw=True, name=remote)
 
-    def put(self, local, remote=None):
+    def put(self, local, remote=None, force=False):
+        """Copy a local file to the board. The agent re-reads what landed on the drive; a
+        mismatch (a full card, a write the board's own filesystem cache ate) is an error, not
+        a reply to inspect. `force` overrides the auto-run guard (see the agent's PUT /file)."""
         with open(local, "rb") as f:
             data = f.read()
-        return self._req("PUT", "/file?name=" + (remote or os.path.basename(local)), data=data)
+        r = self._req("PUT", "/file", data=data, name=remote or os.path.basename(local),
+                      force=force or None)
+        if isinstance(r, dict) and not r.get("matches_sent", True):
+            raise DevError(0, "%s: the drive holds %d B (sha256 %s), not what was sent"
+                           % (remote or local, r.get("size", -1), r.get("sha256")), r)
+        return r
 
     def rm(self, remote):
-        return self._req("DELETE", "/file?name=" + remote)
+        return self._req("DELETE", "/file", name=remote)
 
     def mkdir(self, name):
-        return self._req("POST", "/mkdir?name=" + name, data=b"")
+        return self._req("POST", "/mkdir", data=b"", name=name)
 
     def rmdir(self, name, recursive=False):
-        return self._req("DELETE", "/dir?name=%s&recursive=%d" % (name, 1 if recursive else 0))
+        return self._req("DELETE", "/dir", name=name, recursive=recursive)
 
     def put_tree(self, local_dir, remote_dir=""):
         """Upload a folder, creating directories as needed. Returns per-file results."""
@@ -164,12 +224,15 @@ class Dev:
 
     # ---- console ----
     def read(self, ms=1500):
-        return self._req("GET", "/serial/read?ms=%d" % ms, raw=True).decode("utf-8", "replace")
+        """Console output collected over the next `ms` - CONSUMED: the panel's console will not
+        show it. Prefer tail() for anything that runs beside the panel."""
+        return self._req("GET", "/serial/read", raw=True, deadline=ms / 1000 + 30,
+                         ms=ms).decode("utf-8", "replace")
 
     def tail(self, frm=-1, ms=1500):
-        """Non-consuming console read (agent >= 6): returns {'next', 'text'[, 'gap']}; pass the
-        previous reply's 'next' as `frm`. frm=-1 = just take a cursor at the current end."""
-        return self._req("GET", "/serial/tail?from=%d&ms=%d" % (frm, ms))
+        """Non-consuming console read: returns {'next', 'text'[, 'gap']}; pass the previous
+        reply's 'next' as `frm`. frm=-1 = just take a cursor at the current end."""
+        return self._req("GET", "/serial/tail", deadline=ms / 1000 + 30, **{"from": frm, "ms": ms})
 
     def write(self, text):
         return self._req("POST", "/serial/write", data=text.encode())
@@ -177,57 +240,44 @@ class Dev:
     def reboot(self):
         return self._req("POST", "/serial/reboot", data=b"")
 
-    def run(self, local, as_name="code.py", ms=8000):
+    def run(self, local, as_name="code.py", ms=8000, force=False):
+        """Upload `local` as `as_name`, soft-reboot, and return what the board printed in the
+        next `ms` (the reply's 'output'; the run is cut short when the program ends)."""
         with open(local, "rb") as f:
             data = f.read()
-        return self._req("POST", "/run?name=%s&ms=%d" % (as_name, ms), data=data, timeout=ms / 1000 + 30)
+        return self._req("POST", "/run", data=data, deadline=ms / 1000 + 30,
+                         name=as_name, ms=ms, force=force or None)
 
-    def repl(self, line, ms=4000, settle=0.4):
+    def repl(self, code, ms=6000):
         """Paste code into the REPL and return what it printed - no filesystem write.
 
         Goes through the agent (POST /repl), which reads via a tap: doing it here with
         write-then-read raced the web panel's console poll, and whoever asked first got
-        the output. Falls back to the old way against a pre-v5 agent."""
-        r = self._req("POST", "/repl?ms=%d" % ms, data=line.encode("utf-8"))
-        if isinstance(r, dict) and "output" in r:
-            return r["output"]
-        if isinstance(r, dict) and r.get("error"):
-            raise RuntimeError(r["error"])
-        return self._repl_legacy(line, ms, settle)
-
-    def _repl_legacy(self, line, ms=4000, settle=0.4):
-        """Ctrl-C into the REPL and run one line. The first char after an interrupt is
-        eaten by the prompt, so a bare newline goes first - learned the hard way."""
-        self.write("\x03")
-        time.sleep(settle)
-        self.write("\r\n")
-        time.sleep(0.2)
-        self.read(500)                                   # drop the banner/prompt
-        self.write(line + "\r\n")
-        time.sleep(ms / 1000.0)
-        return self.read(2000)
+        the output."""
+        r = self._req("POST", "/repl", data=code.encode("utf-8"), deadline=ms / 1000 + 30, ms=ms)
+        return r["output"] if isinstance(r, dict) else r
 
     # ---- bootloader / UF2 ----
     def bootloader_status(self):
         return self._req("GET", "/bootloader/status")
 
     def bootloader_enter(self, method="repl", timeout=20):
-        return self._req("POST", "/bootloader/enter?method=%s&timeout=%d" % (method, timeout),
-                         data=b"", timeout=timeout + 20)
+        return self._req("POST", "/bootloader/enter", data=b"", deadline=timeout + 20,
+                         method=method, timeout=timeout)
 
     def uf2(self, path, enter=True, wait=True):
         """Flash a .uf2 the bootloader way: enter BOOTSEL, copy, wait for the board back."""
         with open(path, "rb") as f:
             data = f.read()
-        return self._req("POST", "/uf2?enter=%d&wait=%d" % (int(enter), int(wait)),
-                         data=data, timeout=300)
+        return self._req("POST", "/uf2", data=data, deadline=300, enter=enter, wait=wait)
 
     # ---- debug probe ----
     def ocd(self, action, cfg=None):
         if action == "status":
             return self._req("GET", "/ocd/status")
-        qs = "?cfg=" + cfg if (action == "start" and cfg) else ""
-        return self._req("POST", "/ocd/" + action + qs, data=b"")
+        if action not in ("start", "stop"):
+            raise DevError(400, "ocd action must be start, stop, status or cmd, not %r" % action)
+        return self._req("POST", "/ocd/" + action, data=b"", cfg=cfg if action == "start" else None)
 
     def ocd_cmd(self, cmd):
         return self._req("POST", "/ocd/cmd", data=cmd.encode())
@@ -235,8 +285,7 @@ class Dev:
     def flash(self, path, verify=True, reset=True):
         with open(path, "rb") as f:
             data = f.read()
-        return self._req("POST", "/ocd/flash?verify=%d&reset=%d" % (int(verify), int(reset)),
-                         data=data, timeout=900)
+        return self._req("POST", "/ocd/flash", data=data, deadline=900, verify=verify, reset=reset)
 
 
 # ---- interactive: a live console and a command shell ----------------------------------------
@@ -282,23 +331,36 @@ def console(d, label=None):
     keystrokes go to /serial/write, output comes from /serial/tail (which consumes nothing, so the
     web panel keeps working next to it). Ctrl-] leaves; Ctrl-C and Ctrl-D go to the board."""
     if not sys.stdin.isatty():
-        raise SystemExit("console needs a terminal (stdin is not a tty)")
+        raise DevError(0, "console needs a terminal (stdin is not a tty)")
     first = d.tail(-1, 0)
     if not isinstance(first, dict) or "next" not in first:
-        raise SystemExit("this agent has no /serial/tail (agent v6+ needed): %r" % (first,))
-    label = label or d.board or d.base
+        raise DevError(0, "unexpected reply to /serial/tail: %r" % (first,))
+    try:
+        label = label or d._board_id()
+    except DevError:
+        label = d.base
     sys.stdout.write("--- console on %s: Ctrl-] leaves, Ctrl-C / Ctrl-D go to the board ---\r\n" % label)
     sys.stdout.flush()
     stop = threading.Event()
 
+    def note(text):
+        sys.stdout.write("\r\n[devagent] %s\r\n" % text)
+        sys.stdout.flush()
+
     def pump():
-        cursor = first["next"]
+        cursor, away = first["next"], False
         while not stop.is_set():
             try:
                 r = d.tail(cursor, 1500)
-            except (Exception, SystemExit):            # agent away: keep trying, quietly
-                time.sleep(0.5)
+            except DevError as e:               # agent away or the board gone: say so once,
+                if not away:                    # keep trying, and say when it is back
+                    note("%s - retrying" % e.message)
+                    away = True
+                time.sleep(1.0)
                 continue
+            if away:
+                note("agent is back")
+                away = False
             if isinstance(r, dict) and "next" in r:
                 cursor = r["next"]
                 if r.get("text"):
@@ -313,13 +375,16 @@ def console(d, label=None):
             if leave:
                 keys = keys[:keys.index("\x1d")]
             if keys:
-                r = d.write(keys)
-                if not (isinstance(r, dict) and r.get("sent")) and not warned:
-                    why = r.get("error") if isinstance(r, dict) else r
-                    sys.stdout.write("\r\n[devagent] not sent: %s\r\n"
-                                     % (why or "serial port not open - board missing or busy?"))
-                    sys.stdout.flush()
+                try:
+                    sent = d.write(keys).get("sent")
+                    why = None if sent else "serial port not open - board missing or busy?"
+                except DevError as e:
+                    why = e.message
+                if why and not warned:
+                    note("not sent: %s" % why)
                     warned = True
+                elif not why:
+                    warned = False
             if leave:
                 break
     finally:
@@ -337,7 +402,7 @@ class Shell(cmd.Cmd):
     WORDS = {"ocd": ["start", "stop", "status", "cmd"], "reset": ["soft", "hard"],
              "bootloader": ["enter"], "info": ["refresh"]}
     COMMANDS = sorted(["health", "version", "ports", "free", "list", "get", "put", "puttree", "rm",
-                       "mkdir", "rmdir", "read", "reboot", "run", "repl", "ocd", "bootloader",
+                       "mkdir", "rmdir", "read", "tail", "reboot", "run", "repl", "ocd", "bootloader",
                        "uf2", "boards", "board", "forget", "info", "snippets", "snippet", "reset",
                        "snapshot", "flash", "console", "use", "help", "quit"])
 
@@ -389,8 +454,8 @@ class Shell(cmd.Cmd):
         """console         live terminal on the current board's REPL (Ctrl-] leaves)"""
         try:
             console(self.dev, self.board)
-        except SystemExit as e:
-            print(e)
+        except DevError as e:
+            print(e.message)
 
     def do_quit(self, arg):
         return True
@@ -417,14 +482,12 @@ class Shell(cmd.Cmd):
         argv = self.base + (["--board", self.board] if self.board else []) + argv
         try:
             main(argv)
-        except SystemExit as e:                # argparse errors / explicit exits: stay in the shell
+        except SystemExit as e:                # argparse errors: stay in the shell
             if e.code not in (0, None):
                 print("(exit %s)" % e.code)
-        except (IndexError, KeyError):
-            print("missing argument - `help` shows the syntax")
         except KeyboardInterrupt:
             print("^C")
-        except Exception as e:
+        except Exception as e:                 # a bug must not take the shell down with it
             print("%s: %s" % (type(e).__name__, e))
 
     # -- completion
@@ -470,17 +533,38 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8100)
-    ap.add_argument("--ms", type=int, default=None)
+    ap.add_argument("--ms", type=int, default=None, help="how long to collect output (read/tail/"
+                    "run/repl/snippet; each has its own default)")
+    ap.add_argument("--from", dest="frm", type=int, default=-1, help="tail: cursor to continue from")
     ap.add_argument("--dir", default="")
     ap.add_argument("--recursive", action="store_true")
     ap.add_argument("--as", dest="as_name", default="code.py")
+    ap.add_argument("--force", action="store_true", help="put/run: override the auto-run guard")
     ap.add_argument("--board", default=None, help="board id (only needed if the agent has several)")
-    ap.add_argument("--token", default=None)
+    ap.add_argument("--token", default=os.environ.get("DEVAGENT_TOKEN"),
+                    help="the agent's token (or the DEVAGENT_TOKEN environment variable)")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("cmd")
     ap.add_argument("args", nargs="*")
     a = ap.parse_args(argv)
     d = Dev(a.host, a.port, board=a.board, token=a.token)
+    try:
+        return _run(ap, a, d)
+    except DevUnreachable as e:
+        print("error: %s" % e.message, file=sys.stderr)
+        return 2
+    except DevError as e:
+        print("error: %s" % e.message, file=sys.stderr)
+        return 1
+    except IndexError:
+        print("error: %s needs an argument - `--help` shows the syntax" % a.cmd, file=sys.stderr)
+        return 2
+    except OSError as e:                       # a local file that is not there, not writable
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+
+
+def _run(ap, a, d):
     c, rest = a.cmd, a.args
 
     def show(x):
@@ -513,7 +597,7 @@ def main(argv=None):
         else:
             sys.stdout.write(data.decode("utf-8", "replace"))
     elif c == "put":
-        show(d.put(rest[0], rest[1] if len(rest) > 1 else None))
+        show(d.put(rest[0], rest[1] if len(rest) > 1 else None, force=a.force))
     elif c == "puttree":
         show(d.put_tree(rest[0], rest[1] if len(rest) > 1 else ""))
     elif c == "rm":
@@ -524,14 +608,19 @@ def main(argv=None):
         show(d.rmdir(rest[0], a.recursive))
     elif c == "read":
         emit(d.read(a.ms or 1500))
+    elif c == "tail":                                     # what the board says next, nothing consumed
+        r = d.tail(a.frm, a.ms or 1500)
+        emit(r.get("text", ""))
+        print("-- next cursor: %s%s" % (r.get("next"), " (gap: output lost)" if r.get("gap") else ""),
+              file=sys.stderr)
     elif c == "reboot":
         show(d.reboot())
     elif c == "run":
-        r = d.run(rest[0], a.as_name, a.ms or 8000)
+        r = d.run(rest[0], a.as_name, a.ms or 8000, force=a.force)
         sys.stdout.write(r.pop("output", "") if isinstance(r, dict) else "")
         show(r)
     elif c == "repl":
-        emit(d.repl(rest[0], a.ms or 4000))
+        emit(d.repl(rest[0], a.ms or 6000))
     elif c == "ocd":
         if rest and rest[0] == "cmd":
             show(d.ocd_cmd(rest[1]))
@@ -565,6 +654,8 @@ def main(argv=None):
     elif c == "snippet":
         r = d.snippet(rest[0], a.ms or 6000)
         emit(r.pop("output", "") if isinstance(r, dict) else str(r))
+        if isinstance(r, dict) and r.get("note"):
+            print("note: %s" % r["note"], file=sys.stderr)
     elif c == "reset":
         show(d.reset(rest[0] if rest else "soft"))
     elif c == "snapshot":
@@ -581,6 +672,7 @@ def main(argv=None):
         show(r)
         if out:
             print(out[-1500:])
+        return 0 if r.get("ok") else 1
     else:
         ap.error("unknown command %r" % c)
     return 0
