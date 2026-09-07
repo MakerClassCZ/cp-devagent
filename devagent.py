@@ -78,7 +78,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-AGENT_VERSION = 8
+AGENT_VERSION = 9
 LOG_KEEP = 512 * 1024              # chars of console history kept for /serial/tail
 BUF_KEEP = 256 * 1024              # chars of unread console output kept for /serial/read
 RELINK_EVERY = 2.0                 # s between looks for a board's port/drive under a new name

@@ -210,7 +210,7 @@ a{color:#7fb4ff;text-decoration:none}
 
 <script>
 const $ = id => document.getElementById(id);
-const UI_VERSION = 8;                              // must match AGENT_VERSION in devagent.py
+const UI_VERSION = 9;                              // must match AGENT_VERSION in devagent.py
 let BOARDS = [], CUR = null, AUTHED = false, DISCO = {serial:[],drives:[],openocd_cfgs:[]}, TOKENV = localStorage.getItem("devagent_token") || "";
 $("token").value = TOKENV;
 async function saveToken(){                       // a fresh browser starts with no token: everything
